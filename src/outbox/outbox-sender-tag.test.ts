@@ -17,24 +17,24 @@ function tinCoTag(id: string, noiDung: string, nguoi: { uid: string; ten: string
 
 describe("xuLyHopThu - tag tên", () => {
   it("dungTag: tìm @Tên có sẵn, chèn @Tên còn thiếu vào đầu, hai người trùng tên lấy hai vị trí", () => {
-    const a = dungTag("@Khoa xem giúp nhé", [{ uid: "1", ten: "Khoa" }]);
-    assert.deepEqual(a, { noiDung: "@Khoa xem giúp nhé", nhacTen: [{ uid: "1", pos: 0, len: 4 }] });
-    const b = dungTag("xem giúp nhé", [{ uid: "1", ten: "Khoa" }, { uid: "-1", ten: "All" }]);
-    assert.equal(b.noiDung, "@Khoa @All xem giúp nhé");
+    const a = dungTag("@Huy xem giúp nhé", [{ uid: "1", ten: "Huy" }]);
+    assert.deepEqual(a, { noiDung: "@Huy xem giúp nhé", nhacTen: [{ uid: "1", pos: 0, len: 4 }] });
+    const b = dungTag("xem giúp nhé", [{ uid: "1", ten: "Huy" }, { uid: "-1", ten: "All" }]);
+    assert.equal(b.noiDung, "@Huy @All xem giúp nhé");
     assert.deepEqual(b.nhacTen, [{ uid: "1", pos: 0, len: 4 }, { uid: "-1", pos: 5, len: 4 }]);
     const c = dungTag("@An và @An", [{ uid: "1", ten: "An" }, { uid: "2", ten: "An" }]);
     assert.deepEqual(c.nhacTen.map((x) => x.pos), [0, 7]);
   });
 
   it("gửi kèm danh sách tag đúng vị trí", async () => {
-    tinCoTag("a", "anh xem giúp", [{ uid: "123", ten: "Khoa" }]);
+    tinCoTag("a", "anh xem giúp", [{ uid: "123", ten: "Huy" }]);
     const daGoi: unknown[] = [];
     const gui = async (_t: string, _n: boolean, c: string, _f: unknown[], tag: unknown[]) => {
       daGoi.push({ c, tag });
       return "1";
     };
     await xuLyHopThu({ ...mt.chung, gui });
-    assert.deepEqual(daGoi, [{ c: "@Khoa anh xem giúp", tag: [{ uid: "123", pos: 0, len: 4 }] }]);
+    assert.deepEqual(daGoi, [{ c: "@Huy anh xem giúp", tag: [{ uid: "123", pos: 0, len: 4 }] }]);
   });
 
   it("tag trong chat riêng -> loi, không gửi", async () => {
@@ -46,7 +46,7 @@ describe("xuLyHopThu - tag tên", () => {
   });
 
   it("sửa chữ sau khi duyệt làm lệch tag -> loi (chữ ký không khớp)", async () => {
-    const t = tinCoTag("a", "anh xem giúp", [{ uid: "123", ten: "Khoa" }]);
+    const t = tinCoTag("a", "anh xem giúp", [{ uid: "123", ten: "Huy" }]);
     ghiTin(mt.goc, { ...t, noiDung: "Chú ý: " + t.noiDung });
     const { daGoi, gui } = mt.guiGia();
     await xuLyHopThu({ ...mt.chung, gui });
