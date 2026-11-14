@@ -1,0 +1,143 @@
+import { getTuning } from "../../config/runtime-tuning-settings.js";
+import { isImageGenConfigured } from "../../config/runtime-image-settings.js";
+import { createAddReactionTool } from "./add-reaction-tool.js";
+import { createExcelFileTool, createWordDocumentTool } from "./create-document-tools.js";
+import { createHandoffToHumanTool } from "./handoff-to-human-tool.js";
+import { createImageTool } from "./create-image-tool.js";
+import { createScheduleTaskTool } from "./schedule-task-tool.js";
+import { createSaveMemoryTool } from "./save-memory-tool.js";
+import { createSendFileTool } from "./send-file-tool.js";
+import { createTagMemberTool } from "./tag-member-tool.js";
+import { createTaiVideoTool } from "./tai-video-tool.js";
+import type { ToolDefinition } from "./tool-catalog-types.js";
+
+/**
+ * Nhóm "action" của catalog tool - gửi/sửa thứ gì đó trên Zalo. Tách khỏi
+ * `tool-catalog.ts` (đúng nếp tách theo NHÓM đã bàn ở phase 04) để không file
+ * catalog nào vượt ngưỡng 200 dòng khi thêm tool mới.
+ */
+export const ACTION_TOOL_DEFINITIONS: ToolDefinition[] = [
+  {
+    key: "add_reaction",
+    label: "Thả cảm xúc",
+    description: "Thả reaction (tim, like...) vào tin nhắn trong hội thoại",
+    group: "action",
+    // Không khoe: đây là phép lịch sự trong lúc trò chuyện, không phải việc ai
+    // đó nhờ bot làm.
+    keTrongKhaNang: false,
+    // Lượt theo lịch không có tin thật nào (msgId rỗng) để mà thả reaction vào
+    runsInScheduledTurn: false,
+    build: (ctx) => createAddReactionTool(ctx),
+  },
+  {
+    key: "send_file",
+    label: "Gửi file",
+    description: "Gửi file từ kho shared-files hoặc tải từ URL công khai rồi gửi",
+    group: "action",
+    // Gọi thẳng `enqueueSend` (rate-limiter THEO THREAD, không phải trần ngày)
+    // để gửi - vào lượt theo lịch sẽ né hoàn toàn `SCHEDULER_MAX_PROACTIVE_PER_DAY`,
+    // vì bộ đếm trần chỉ tăng ở đường `deliverProactively`/`reserveProactiveSlot`
+    // của scheduler. Loại khỏi lượt theo lịch cho tới khi tool này đi qua đúng
+    // đường đếm trần (đợt sau).
+    runsInScheduledTurn: false,
+    build: (ctx) => createSendFileTool(ctx),
+  },
+  {
+    key: "create_word_document",
+    label: "Tạo file Word",
+    description: "Soạn nội dung thành file .docx (tiêu đề, đoạn văn, gạch đầu dòng, bảng) rồi gửi luôn",
+    group: "action",
+    // Cùng lý do runsInScheduledTurn:false của send_file - gửi thẳng qua
+    // enqueueSend, né trần ngày.
+    runsInScheduledTurn: false,
+    build: (ctx) => createWordDocumentTool(ctx),
+  },
+  {
+    key: "create_excel_file",
+    label: "Tạo file Excel",
+    description: "Soạn bảng số liệu thành file .xlsx có công thức tính sẵn rồi gửi luôn",
+    group: "action",
+    // Cùng lý do runsInScheduledTurn:false của send_file - gửi thẳng qua
+    // enqueueSend, né trần ngày.
+    runsInScheduledTurn: false,
+    build: (ctx) => createExcelFileTool(ctx),
+  },
+  {
+    key: "create_image",
+    label: "Vẽ ảnh AI",
+    description: "Vẽ ảnh mới hoặc sửa ảnh người dùng vừa gửi (đổi màu, xóa vật thể, đổi phong cách) rồi gửi luôn",
+    group: "action",
+    hasSettings: true,
+    available: () => isImageGenConfigured(),
+    unavailableHint: "Bấm Settings để cấu hình endpoint + model vẽ ảnh",
+    // Cùng lý do runsInScheduledTurn:false của send_file - gửi 2 tin ("đang
+    // vẽ..." rồi ảnh) thẳng qua enqueueSend, né trần ngày. Nặng nhất trong
+    // nhóm 5 tool này: job every 5 phút + prompt "vẽ ảnh rồi [SILENT]" ra
+    // hàng trăm tin chủ động/ngày mà trần không bao giờ chặn được.
+    runsInScheduledTurn: false,
+    build: (ctx) => createImageTool(ctx),
+  },
+  {
+    key: "tai_video",
+    label: "Tải video TikTok/Facebook",
+    description: "Người dùng dán link TikTok hoặc Facebook, bot tải bản không watermark rồi gửi lại",
+    group: "action",
+    // Cùng lý do runsInScheduledTurn:false của send_file - gửi thẳng qua
+    // enqueueSend nên né hoàn toàn trần tin chủ động mỗi ngày. Nặng hơn nữa:
+    // một job "tải video mỗi 5 phút" là đường ngắn nhất tới việc mất nick Zalo.
+    runsInScheduledTurn: false,
+    build: (ctx) => createTaiVideoTool(ctx),
+  },
+  {
+    key: "tag_member",
+    label: "Tag thành viên",
+    description: "Nhắc tên (@mention) thành viên trong nhóm khi trả lời",
+    group: "action",
+    // Cùng lý do runsInScheduledTurn:false của send_file - gửi thẳng qua
+    // enqueueSend, né trần ngày.
+    runsInScheduledTurn: false,
+    build: (ctx) => createTagMemberTool(ctx),
+  },
+  {
+    key: "save_memory",
+    label: "Ghi nhớ lâu dài",
+    description: "Tự lưu fact về người dùng/nhóm để nhớ qua các phiên chat sau",
+    group: "action",
+    // Đường nội dung web đi vào trí nhớ vĩnh viễn là prompt injection thật, và
+    // lượt theo lịch vốn không có phát ngôn nào của user để mà học
+    runsInScheduledTurn: false,
+    build: (ctx) => createSaveMemoryTool(ctx),
+  },
+  {
+    key: "schedule_task",
+    label: "Lịch hẹn",
+    description: "Đặt/xem/sửa/hủy lịch để bot tự nhắn lại đúng cuộc trò chuyện này ở một mốc giờ trong tương lai",
+    group: "action",
+    // Tắt cả tính năng lịch hẹn (vòng tick không chạy nữa) thì tool cũng biến
+    // khỏi schema - đặt job mới lúc đó vô nghĩa, không có gì nhặt job lên chạy
+    available: () => getTuning("SCHEDULER_ENABLED"),
+    unavailableHint: 'Bật "Bật lịch hẹn" trong Cấu hình > Lịch hẹn để dùng tool này',
+    // Luật số 1 của Hermes: job không được đẻ job
+    runsInScheduledTurn: false,
+    build: (ctx) => createScheduleTaskTool(ctx),
+  },
+  {
+    key: "handoff_to_human",
+    label: "Chuyển cho người thật",
+    description:
+      "Khi khách đòi gặp nhân viên, khiếu nại, hoặc bot không có thông tin: tạm dừng bot ở cuộc chat đó và nhắn báo cho người vận hành",
+    group: "action",
+    // Opt-in theo account: chưa điền Zalo ID nhận báo thì không cấp. Bot cũ
+    // không tự dưng biết tự tắt mình ở các cuộc chat.
+    available: (scope) => Boolean(scope.account.handoffNotifyUserId),
+    unavailableHint: 'Điền "Zalo ID nhận báo chuyển người thật" ở trang Tài khoản để bật tool này',
+    // Lượt theo lịch không có khách nào đang chờ để mà chuyển
+    runsInScheduledTurn: false,
+    // import ĐỘNG: handoff-notify kéo account-manager, mà account-manager đi
+    // vòng về registry này - import tĩnh là vòng import lúc nạp module.
+    build: (ctx) =>
+      createHandoffToHumanTool(ctx, async (accountId, nguoiNhanId, noiDung) =>
+        (await import("../../zalo/handoff-notify.js")).guiBaoChuyenNguoiThat(accountId, nguoiNhanId, noiDung),
+      ),
+  },
+];

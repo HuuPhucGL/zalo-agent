@@ -1,0 +1,396 @@
+import { useEffect, useState } from "react";
+import type { ManagedAccount, ManagedAgent, ReactionIcon } from "../dashboard-api-client";
+import { api, ApiError } from "../dashboard-api-client";
+import { useChotNen } from "../shared/backdrop-close-guard";
+import { MO_TA_KENH_BOT, MO_TA_KENH_CA_NHAN } from "./mo-ta-loai-kenh";
+import { SelectMenu } from "../shared/select-menu";
+import { ToggleKnob } from "../shared/ui-bits";
+
+function Toggle({ value, onChange, label, hint }: {
+  value: boolean;
+  onChange: (v: boolean) => void;
+  label: string;
+  hint?: string;
+}) {
+  return (
+    <button type="button" onClick={() => onChange(!value)} className="flex w-full items-center justify-between gap-3 py-1 text-left">
+      <span>
+        <span className="block text-[13px] font-medium text-ink">{label}</span>
+        {hint && <span className="block text-[12px] leading-[1.6] text-ink-soft">{hint}</span>}
+      </span>
+      <ToggleKnob on={value} />
+    </button>
+  );
+}
+
+/** Drawer tạo/sửa account: tên, não, policies. account=null nghĩa là tạo mới. */
+export function AccountEditDrawer({
+  account,
+  agents,
+  onClose,
+  onSaved,
+}: {
+  account: ManagedAccount | null;
+  agents: ManagedAgent[];
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const [form, setForm] = useState({
+    id: account?.id ?? "",
+    label: account?.label ?? "",
+    agentId: account?.agentId ?? agents.find((a) => a.isDefault)?.id ?? agents[0]?.id ?? "",
+    groupRequireMention: account?.groupRequireMention ?? true,
+    respondToGroups: account?.respondToGroups ?? true,
+    groupPassiveListen: account?.groupPassiveListen ?? true,
+    autoReactEnabled: account?.autoReactEnabled ?? true,
+    autoReactIcon: account?.autoReactIcon ?? "heart",
+    typingIndicatorEnabled: account?.typingIndicatorEnabled ?? true,
+    autoAcceptFriends: account?.autoAcceptFriends ?? false,
+    autoAcceptFriendDelayMinutes: account?.autoAcceptFriendDelayMinutes ?? 1,
+    readOnly: account?.readOnly ?? false,
+    handoffNotifyUserId: account?.handoffNotifyUserId ?? "",
+    allowlistMode: account?.allowlist.mode ?? "all",
+    allowlistIds: (account?.allowlist.userIds ?? []).join("\n"),
+    /** Chốt LÚC TẠO, không đổi được sau đó - xem `createSchema` ở account-routes */
+    loai: account?.loai ?? ("ca_nhan" as "ca_nhan" | "bot"),
+  });
+  /** Token bot nhập mới; rỗng = không đụng tới token đã lưu */
+  const [botToken, setBotToken] = useState("");
+  /**
+   * Id đã TẠO XONG trong chính lần mở drawer này.
+   *
+   * `save()` chạy ba bước (create -> update -> lưu token) và bước cuối có thể
+   * hỏng riêng (server kiểm token với Zalo). Hỏng thì drawer đứng nguyên với
+   * `account` vẫn null, nên bấm lại là gọi `create()` lần hai và ăn 409
+   * "Account id đã tồn tại" - đọc ngay sau khi tự tay tạo nó trong chính drawer
+   * này thì không ai hiểu chuyện gì.
+   */
+  const [daTao, setDaTao] = useState<string | null>(null);
+  const [reactionIcons, setReactionIcons] = useState<ReactionIcon[]>([]);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const nen = useChotNen(onClose);
+
+  useEffect(() => {
+    api.accountsAdmin
+      .reactionIcons()
+      .then((d) => setReactionIcons(d.items))
+      .catch(() => setReactionIcons([]));
+  }, []);
+
+  /**
+   * Đổi loại kênh thì đặt lại mặc định danh sách cho phép.
+   *
+   * Tài khoản bot ĐÓNG sẵn: bán kính khác hẳn tài khoản cá nhân - nick cá nhân
+   * phải là bạn bè mới nhắn được, còn bot thì ai có link cũng nhắn được. Server
+   * cũng đặt mặc định này lúc tạo, nhưng drawer gọi `update()` NGAY sau `create()`
+   * nên không đồng bộ ở đây là ghi đè mất mặc định an toàn vừa đặt.
+   */
+  function doiLoai(loai: "ca_nhan" | "bot") {
+    setForm((truoc) => ({ ...truoc, loai, allowlistMode: loai === "bot" ? "list" : "all" }));
+  }
+
+  const agentOptions = agents.map((a) => ({
+    value: a.id,
+    label: `${a.icon} ${a.name}`,
+    hint: a.isDefault ? "mặc định" : undefined,
+  }));
+
+  async function save() {
+    setBusy(true);
+    setError("");
+    const patch = {
+      label: form.label,
+      agentId: form.agentId,
+      groupRequireMention: form.groupRequireMention,
+      respondToGroups: form.respondToGroups,
+      groupPassiveListen: form.groupPassiveListen,
+      autoReactEnabled: form.autoReactEnabled,
+      autoReactIcon: form.autoReactIcon,
+      typingIndicatorEnabled: form.typingIndicatorEnabled,
+      autoAcceptFriends: form.autoAcceptFriends,
+      autoAcceptFriendDelayMinutes: form.autoAcceptFriendDelayMinutes,
+      readOnly: form.readOnly,
+      handoffNotifyUserId: form.handoffNotifyUserId.trim(),
+      allowlist: {
+        mode: form.allowlistMode as "all" | "list",
+        userIds: form.allowlistIds.split("\n").map((s) => s.trim()).filter(Boolean),
+      },
+    };
+    try {
+      if (account || daTao) {
+        await api.accountsAdmin.update(account?.id ?? daTao!, patch);
+      } else {
+        await api.accountsAdmin.create({
+          id: form.id,
+          label: form.label,
+          agentId: form.agentId,
+          loai: form.loai,
+        });
+        setDaTao(form.id);
+        await api.accountsAdmin.update(form.id, patch);
+      }
+      // Token lưu SAU cùng và qua đường riêng: server kiểm với API Zalo trước
+      // khi lưu, nên bước này có thể hỏng riêng mà phần cấu hình vẫn đã lưu xong.
+      if (form.loai === "bot" && botToken.trim()) {
+        await api.accountsAdmin.setBotToken(account?.id ?? form.id, botToken.trim());
+      }
+      onSaved();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Lưu thất bại");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex justify-end bg-ink/25 backdrop-blur-[2px]" {...nen}>
+      <div className="flex h-full w-full max-w-md flex-col border-l border-line bg-surface">
+        <div className="flex items-center justify-between border-b border-line px-5 py-4">
+          <div className="font-semibold text-ink">{account ? `Sửa: ${account.label}` : "Thêm account Zalo"}</div>
+          <button onClick={onClose} className="rounded-lg border border-line px-3 py-1 text-[13px] text-ink-soft hover:bg-tile">
+            Đóng
+          </button>
+        </div>
+
+        <div className="flex-1 space-y-4 overflow-y-auto px-5 py-4">
+          {!account && (
+            <div>
+              <label className="mb-1.5 block text-[13px] font-medium text-ink">
+                ID <span className="font-normal text-ink-soft">(kebab-case, dùng làm thư mục data)</span>
+              </label>
+              <input
+                className="gc-input w-full"
+                value={form.id}
+                onChange={(e) => setForm({ ...form, id: e.target.value })}
+                placeholder="vd: acc-cham-soc"
+              />
+            </div>
+          )}
+
+          {!account && (
+            <div>
+              <label className="mb-1.5 block text-[13px] font-medium text-ink">Loại kênh</label>
+              <SelectMenu
+                value={form.loai}
+                /*
+                 * Hint NGẮN: đoạn giải thích đầy đủ đã nằm ngay dưới ô chọn, nên
+                 * hint dài chỉ lặp lại và đẩy popup rộng quá drawer.
+                 */
+                options={[
+                  { value: "ca_nhan", label: "Tài khoản cá nhân", hint: "quét QR" },
+                  { value: "bot", label: "Tài khoản bot chính thức", hint: "nhập token" },
+                ]}
+                onChange={(v) => doiLoai(v as "ca_nhan" | "bot")}
+              />
+              <p className="mt-1.5 text-[12px] leading-[1.6] text-ink-soft">
+                {form.loai === "bot" ? MO_TA_KENH_BOT : MO_TA_KENH_CA_NHAN}
+              </p>
+              <p className="mt-1 text-[12px] text-ink-soft">Chốt lúc tạo, không đổi được sau đó.</p>
+            </div>
+          )}
+
+          <div>
+            <label className="mb-1.5 block text-[13px] font-medium text-ink">Tên hiển thị</label>
+            <input
+              className="gc-input w-full"
+              value={form.label}
+              onChange={(e) => setForm({ ...form, label: e.target.value })}
+              placeholder="vd: Nick chăm sóc khách hàng"
+            />
+          </div>
+
+          {form.loai === "bot" && (
+            <div>
+              <label className="mb-1.5 block text-[13px] font-medium text-ink">
+                Token bot{" "}
+                {account?.coBotToken && <span className="font-normal text-ink-soft">(đã có - nhập mới để thay)</span>}
+              </label>
+              <input
+                type="password"
+                autoComplete="off"
+                className="gc-input w-full font-mono"
+                value={botToken}
+                onChange={(e) => setBotToken(e.target.value)}
+                placeholder={account?.coBotToken ? "Để trống nếu không đổi" : "123456789:..."}
+              />
+              <p className="mt-1.5 text-[12px] leading-[1.6] text-ink-soft">
+                Lấy token: mở Zalo, tìm OA "Zalo Bot Manager", chọn "Tạo bot" (tên phải bắt đầu bằng "Bot").
+                Token được gửi vào tin nhắn Zalo cho bạn. Hệ thống sẽ kiểm token với Zalo trước khi lưu.
+              </p>
+            </div>
+          )}
+
+          <div>
+            <label className="mb-1.5 block text-[13px] font-medium text-ink">Agent (não)</label>
+            <SelectMenu
+              value={form.agentId}
+              options={agentOptions}
+              onChange={(agentId) => setForm({ ...form, agentId })}
+            />
+          </div>
+
+          <div className="space-y-2 rounded-xl border border-line p-4">
+            <div className="text-[11px] font-semibold uppercase tracking-wider text-ink-soft">Policies</div>
+            <Toggle
+              value={form.readOnly}
+              onChange={(v) => setForm({ ...form, readOnly: v })}
+              label="Chế độ chỉ đọc"
+              hint="Không trả lời ai, chỉ ghi mọi tin ra file log theo ngày (data/exports) cho AI đọc lọc việc"
+            />
+            <Toggle
+              value={form.respondToGroups}
+              onChange={(v) => setForm({ ...form, respondToGroups: v })}
+              label="Trả lời trong nhóm"
+            />
+            <Toggle
+              value={form.groupRequireMention}
+              onChange={(v) => setForm({ ...form, groupRequireMention: v })}
+              label="Nhóm phải @mention mới trả lời"
+            />
+            <Toggle
+              value={form.groupPassiveListen}
+              onChange={(v) => setForm({ ...form, groupPassiveListen: v })}
+              label="Nghe passive trong nhóm"
+              hint="Tin không @mention vẫn ghi vào ngữ cảnh, không tốn LLM"
+            />
+          </div>
+
+          <div className="space-y-2 rounded-xl border border-line p-4">
+            <div className="text-[11px] font-semibold uppercase tracking-wider text-ink-soft">
+              Phản hồi tức thì
+            </div>
+            <Toggle
+              value={form.typingIndicatorEnabled}
+              onChange={(v) => setForm({ ...form, typingIndicatorEnabled: v })}
+              label='Hiện "đang nhập" khi bot xử lý'
+              hint="Giống người thật đang gõ, tự tắt khi gửi xong"
+            />
+            {/* Kênh bot KHÔNG thả được cảm xúc (`setMessageReaction` trả 404).
+                Để ô này hiện thì người vận hành bật xong tưởng có, mà chẳng
+                bao giờ thấy cảm xúc nào - cùng lớp lỗi với việc trang Tools
+                từng hiện "Gửi file" xanh cho tài khoản bot. */}
+            {form.loai === "bot" ? (
+              <p className="py-1 text-[13px] leading-[1.6] text-ink-soft">
+                <span className="font-medium text-ink">Thả cảm xúc khi nhận tin</span> - Zalo Bot API
+                không có method thả cảm xúc nên tài khoản bot không dùng được mục này.
+              </p>
+            ) : (
+              <>
+            <Toggle
+              value={form.autoReactEnabled}
+              onChange={(v) => setForm({ ...form, autoReactEnabled: v })}
+              label="Thả cảm xúc khi nhận tin"
+              hint="Báo cho người nhắn biết bot đã thấy tin"
+            />
+            {form.autoReactEnabled && reactionIcons.length > 0 && (
+              <div className="flex flex-wrap gap-1.5 pt-1">
+                {reactionIcons.map((icon) => (
+                  <button
+                    key={icon.key}
+                    type="button"
+                    title={icon.label}
+                    onClick={() => setForm({ ...form, autoReactIcon: icon.key })}
+                    className={`flex h-9 w-9 items-center justify-center rounded-lg border text-lg transition-colors ${
+                      form.autoReactIcon === icon.key
+                        ? "border-zalo-500 bg-zalo-50 ring-2 ring-zalo-100"
+                        : "border-line hover:bg-tile"
+                    }`}
+                  >
+                    {icon.emoji}
+                  </button>
+                ))}
+              </div>
+            )}
+            </>
+            )}
+          </div>
+
+          {form.loai === "ca_nhan" && (
+            <div className="space-y-2 rounded-xl border border-line p-4">
+              <div className="text-[11px] font-semibold uppercase tracking-wider text-ink-soft">Kết bạn</div>
+              <Toggle
+                value={form.autoAcceptFriends}
+                onChange={(v) => setForm({ ...form, autoAcceptFriends: v })}
+                label="Tự động chấp nhận yêu cầu kết bạn"
+                hint="Bot tự accept sau khoảng chờ dưới đây. Tắt thì bạn tự duyệt ở tab Bạn bè."
+              />
+              {form.autoAcceptFriends && (
+                <label className="flex items-center gap-2 pt-1 text-[13px] text-ink-soft">
+                  Chờ
+                  <input
+                    type="number"
+                    min={0}
+                    max={1440}
+                    step={1}
+                    value={form.autoAcceptFriendDelayMinutes}
+                    onChange={(e) =>
+                      setForm({
+                        ...form,
+                        // Math.round: server validate .int(), số thập phân -> 400.
+                        autoAcceptFriendDelayMinutes: Math.max(0, Math.min(1440, Math.round(Number(e.target.value) || 0))),
+                      })
+                    }
+                    className="w-20 rounded-lg border border-line bg-surface px-2 py-1 text-ink"
+                  />
+                  phút rồi mới accept
+                </label>
+              )}
+            </div>
+          )}
+
+          <div className="space-y-2 rounded-xl border border-line p-4">
+            <div className="text-[11px] font-semibold uppercase tracking-wider text-ink-soft">Chuyển cho người thật</div>
+            <label className="block text-[13px] text-ink-soft" htmlFor="handoff-notify-id">
+              Zalo ID nhận báo chuyển người thật
+            </label>
+            <input
+              id="handoff-notify-id"
+              className="gc-input w-full"
+              value={form.handoffNotifyUserId}
+              onChange={(e) => setForm({ ...form, handoffNotifyUserId: e.target.value })}
+              placeholder="Bỏ trống = tắt"
+            />
+            <p className="text-[12px] leading-[1.5] text-ink-soft">
+              Khi khách đòi gặp nhân viên, khiếu nại, hoặc bot không có thông tin, bot tự tạm dừng ở cuộc chat đó và nhắn
+              báo vào Zalo ID này. Lấy ID: dùng nick của bạn nhắn cho nick bot một tin, rồi chép cột ID ở trang Sessions.
+              Xử lý xong thì bật lại bot cho cuộc chat đó ở trang Sessions.
+            </p>
+          </div>
+
+          <div className="space-y-2 rounded-xl border border-line p-4">
+            <div className="text-[11px] font-semibold uppercase tracking-wider text-ink-soft">Allowlist</div>
+            <SelectMenu
+              value={form.allowlistMode}
+              options={[
+                { value: "all", label: "Trả lời tất cả mọi người" },
+                { value: "list", label: "Chỉ trả lời user ID trong danh sách" },
+              ]}
+              onChange={(allowlistMode) => setForm({ ...form, allowlistMode: allowlistMode as "all" | "list" })}
+            />
+            {form.allowlistMode === "list" && (
+              <textarea
+                className="gc-input min-h-24 w-full resize-y"
+                value={form.allowlistIds}
+                onChange={(e) => setForm({ ...form, allowlistIds: e.target.value })}
+                placeholder={"Mỗi dòng 1 user ID\n1234567890123456789"}
+              />
+            )}
+          </div>
+
+          {error && <p className="text-[13px] text-red-600 dark:text-red-400">{error}</p>}
+        </div>
+
+        <div className="border-t border-line px-5 py-4">
+          <button
+            onClick={save}
+            disabled={busy || !form.label || (!account && !form.id)}
+            className="w-full rounded-lg bg-zalo-500 py-2.5 text-[14px] font-medium text-white hover:bg-zalo-600 disabled:opacity-50"
+          >
+            {busy ? "Đang lưu..." : account ? "Lưu thay đổi" : "Tạo account"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}

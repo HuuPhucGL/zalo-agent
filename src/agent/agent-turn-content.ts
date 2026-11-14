@@ -1,0 +1,255 @@
+import type { ModelMessage, UserContent } from "ai";
+import { isSidecarConfigured } from "../config/runtime-vision-settings.js";
+import type { StoredMessage } from "../conversation/history-store.js";
+import { getImageDescription } from "../conversation/image-description-store.js";
+import { loadStoredImage } from "../conversation/media-store.js";
+import { downloadImageAsBase64 } from "../shared/download-image.js";
+import type { ParsedMessage } from "../zalo/zalo-message-parser.js";
+import {
+  collectImagesWithinBudget,
+  historyToModelMessages,
+  senderTrustFrom,
+  type HistoryImageRendering,
+} from "./history-to-model-messages.js";
+import type { ModelOverride } from "./llm-provider.js";
+import { classifyModelVision } from "./model-vision-detection.js";
+import { nganSachAnToan } from "./token-estimate.js";
+import { catNguCanhTheoNganSach, type KetQuaCat } from "./trim-context-to-budget.js";
+import { describeImage, ensureDescriptionsFor } from "./vision-sidecar.js";
+
+import { botTimeZone, getTuning } from "../config/runtime-tuning-settings.js";
+import { dongTinCuaLuot } from "./batch-to-user-lines.js";
+
+/**
+ * Dựng input cho 1 lượt agent theo 4 chế độ ảnh (mô hình auto|native|text của
+ * Hermes, thêm blind khi không có sidecar và hybrid cho combo của 9Router):
+ *
+ * - native:   model chính đọc được ảnh - đính pixel như trước giờ.
+ * - describe: model chính KHÔNG đọc được ảnh nhưng có sidecar - thay pixel
+ *             bằng text mô tả (sidecar mô tả 1 lần, cache DB).
+ * - hybrid:   model là COMBO trộn thành viên có/không vision - đính CẢ pixel
+ *             LẪN mô tả: thành viên vision thấy pixel, lượt rơi vào thành viên
+ *             mù (fallback, hoặc ảnh history không kích hoạt auto-switch của
+ *             router) bị lột pixel nhưng mô tả text sống sót.
+ * - blind:    không đọc được ảnh, không có sidecar - bỏ ảnh, chèn ghi chú để
+ *             bot nói thật thay vì im lặng hoặc bịa.
+ */
+
+export type ImageContextMode = "native" | "describe" | "hybrid" | "blind";
+
+export async function resolveImageContextMode(override?: ModelOverride): Promise<ImageContextMode> {
+  const kind = await classifyModelVision(override);
+  const sidecar = isSidecarConfigured();
+  switch (kind) {
+    case "no-vision":
+      return sidecar ? "describe" : "blind";
+    case "combo":
+      // Không có sidecar thì hybrid không làm được gì hơn native - router
+      // auto-switch vẫn tự đẩy thành viên vision lên đầu khi lượt có ảnh
+      return sidecar ? "hybrid" : "native";
+    default:
+      // vision + unknown: lạc quan như hành vi cũ
+      return "native";
+  }
+}
+
+const blindImageNote = (count: number): string =>
+  `[Người dùng gửi kèm ${count} ảnh nhưng bạn KHÔNG xem được ảnh trực tiếp - ` +
+  "nói thật điều đó và nhờ họ mô tả bằng chữ nếu cần nội dung ảnh để trả lời.]";
+
+const DESCRIBE_FAILED_NOTE =
+  "[Có ảnh đính kèm nhưng hệ thống đọc ảnh đang trục trặc, chưa mô tả được - " +
+  "nói thật với người dùng nếu cần nội dung ảnh để trả lời.]";
+
+function historyRendering(imageMode: ImageContextMode): HistoryImageRendering | undefined {
+  if (imageMode === "describe") return { describe: getImageDescription, keepPixels: false };
+  if (imageMode === "hybrid") return { describe: getImageDescription, keepPixels: true };
+  return undefined;
+}
+
+/**
+ * History + batch hiện tại -> messages hoàn chỉnh cho generateText, ảnh đã xử
+ * lý đúng chế độ. Trả kèm imageMode để agent-loop ghi log chẩn đoán được.
+ *
+ * @param forceMode ép chế độ thay vì tự phát hiện - đường reactive fallback:
+ * lượt native bị provider từ chối ảnh (4xx) thì agent-loop dựng lại input ở
+ * describe/blind rồi thử lại, không đợi cache detect hết hạn.
+ */
+export async function buildTurnMessages(params: {
+  history: StoredMessage[];
+  batch: ParsedMessage[];
+  /**
+   * id các dòng lịch sử KHÔNG thuộc lượt này - tin đang chờ trong hàng gộp.
+   * Xem `AgentTurnParams.layIdDangCho`.
+   */
+  idBoQua?: number[];
+  /**
+   * Trần SỐ TIN lịch sử SAU KHI lọc. Caller phải đọc dư từ DB (dư đúng bằng số
+   * dòng sắp bị lọc) rồi truyền trần thật vào đây; bỏ trống hoặc 0 = không cắt.
+   */
+  tranLichSu?: number;
+  override?: ModelOverride;
+  forceMode?: ImageContextMode;
+  /** Có thì tin của người ngoài danh sách bị gắn nhãn chưa xác minh trong history */
+  allowlist?: { mode: "all" | "list"; userIds: string[] };
+  /**
+   * Trần token phần input - CỬA SỔ của model, không phải ngân sách đã trừ hao
+   * (hàm tự trừ qua `nganSachAnToan`).
+   *
+   * BẮT BUỘC, không optional: để optional với mặc định 0 thì quên truyền nghĩa
+   * là tắt ngân sách một cách âm thầm - đúng lỗi đã dính ở đường dựng lại input
+   * sau khi provider từ chối ảnh. Không muốn giới hạn thì truyền 0 tường minh.
+   */
+  tranToken: number;
+  /**
+   * Bước mô tả trước các ảnh lịch sử sắp vào context. Có seam vì đường thật gọi
+   * sidecar qua mạng, mà bất biến cần ghim ở đây KHÔNG phải "mô tả đúng" - nó là
+   * "mô tả đúng DANH SÁCH ảnh mà phần render sẽ dùng".
+   *
+   * Bất biến đó từng vỡ và vỡ CÂM: bước mô tả chạy trên lịch sử chưa lọc còn
+   * phần render chạy trên bản đã lọc, nên ngân sách mô tả rơi vào ảnh của chính
+   * lượt này, ảnh cũ không bao giờ được mô tả, mà chế độ `describe` lại bỏ luôn
+   * pixel - dòng đó xuống model thành chữ trần, không dấu vết nào của tấm ảnh.
+   */
+  moTaTruoc?: typeof ensureDescriptionsFor;
+}): Promise<{
+  messages: ModelMessage[];
+  imageMode: ImageContextMode;
+  /** null = không phải cắt gì. Có giá trị thì agent-loop ghi log cảnh báo. */
+  daCat: KetQuaCat["daCat"];
+}> {
+  const imageMode = params.forceMode ?? (await resolveImageContextMode(params.override));
+  // blind: ngân sách ảnh history = 0, content tự rơi về text "[gửi kèm N ảnh]"
+  const imageLimit = imageMode === "blind" ? 0 : getTuning("HISTORY_IMAGE_CONTEXT_LIMIT");
+
+  // Lọc MỘT lần rồi dùng chung cho cả bước mô tả ảnh lẫn bước dựng tin. Hai bên
+  // chạy trên hai danh sách khác nhau là ngân sách ảnh rơi vào tấm này còn phần
+  // render lại cần tấm kia: ảnh cũ không bao giờ được mô tả, mà chế độ
+  // `describe` thì cũng bỏ luôn pixel - dòng đó xuống model thành chữ trần,
+  // không một dấu vết nào của tấm ảnh, và hỏng CÂM.
+  const lichSu = locLichSuChoLuot(params);
+
+  if (imageMode === "describe" || imageMode === "hybrid") {
+    // Mô tả TRƯỚC các ảnh history sắp vào context - gồm cả ảnh passive-listen
+    // chưa từng qua lượt agent nào (nhóm gửi vé số rồi mới @mention bot).
+    // Build messages phía dưới chỉ đọc cache sync.
+    const moTa = params.moTaTruoc ?? ensureDescriptionsFor;
+    await moTa(collectImagesWithinBudget(lichSu, imageLimit), loadStoredImage);
+  }
+
+  const messages = historyToModelMessages(
+    lichSu,
+    imageLimit,
+    loadStoredImage,
+    botTimeZone(),
+    historyRendering(imageMode),
+    params.allowlist ? senderTrustFrom(params.allowlist) : undefined,
+  );
+  // Cả batch của lượt này gộp thành ĐÚNG MỘT tin user - nên vùng bảo vệ khỏi
+  // bị cắt là 1 tin cuối. Con số này phải khớp với dòng push ngay dưới; đổi
+  // cách gộp batch thì phải đổi theo.
+  messages.push({ role: "user", content: await buildCurrentTurnContent(params.batch, imageMode) });
+
+  // Ngân sách suy từ trần bằng `nganSachAnToan` - MỘT hàm dùng chung với điều
+  // kiện dừng trong lượt (`vuotTranToken`) và với lượt chốt. Trước đây chỗ này
+  // tự nhân 0.7 còn điều kiện dừng so với 100% trần, nên hai nửa của cùng một
+  // tính năng hiểu con số theo hai nghĩa khác nhau.
+  const { tinNhan, daCat } = catNguCanhTheoNganSach({
+    tinNhan: messages,
+    tranToken: nganSachAnToan(params.tranToken),
+    soTinBaoVeCuoi: 1,
+    coAnh: getTuning("ZALO_IMAGE_QUALITY"),
+  });
+  return { messages: tinNhan, imageMode, daCat };
+}
+
+/**
+ * Phần lịch sử THẬT của lượt: bỏ đi những dòng không thuộc về nó, rồi cắt lại
+ * đúng trần số tin.
+ *
+ * Bỏ hai nhóm:
+ *
+ *   1. Tin của CHÍNH batch này. Tin người dùng nay ghi NGAY LÚC NHẬN
+ *      (`record-incoming-message.ts`), nên lúc lượt đọc lịch sử thì câu hỏi của
+ *      nó đã nằm sẵn trong đó; không lọc là model đọc cùng câu hỏi hai lần.
+ *   2. Tin ĐANG CHỜ trong hàng gộp (`idBoQua`). Chúng hoặc sẽ được `layTinChen`
+ *      kéo vào giữa lượt kèm nhãn "vừa có tin mới", hoặc thuộc về lượt sau -
+ *      cả hai đều không phải lịch sử của lượt này.
+ *
+ * Lọc theo id DÒNG chứ không theo nội dung: hai người nhắn y hệt nhau, hay một
+ * người hỏi lại đúng câu cũ, đều là chuyện thường và không được nuốt mất.
+ *
+ * CẮT LẠI sau khi lọc là phần dễ quên nhất. `getRecentMessages` trả về N tin
+ * MỚI NHẤT, mà mấy dòng vừa lọc nằm ngay trong số đó - caller phải xin dư rồi
+ * để hàm này cắt về đúng trần, không thì cửa sổ lịch sử teo đi đúng bằng cỡ
+ * batch và không ai thấy.
+ *
+ * Không có gì để lọc (test gọi thẳng, hoặc lượt theo lịch với tin tổng hợp) thì
+ * chỉ còn bước cắt - đúng hành vi cũ.
+ */
+function locLichSuChoLuot(params: {
+  history: StoredMessage[];
+  batch: ParsedMessage[];
+  idBoQua?: number[];
+  tranLichSu?: number;
+}): StoredMessage[] {
+  const boQua = new Set<number>(params.idBoQua ?? []);
+  for (const m of params.batch) if (m.historyRowId !== undefined) boQua.add(m.historyRowId);
+
+  const conLai =
+    boQua.size === 0
+      ? params.history
+      : params.history.filter((h) => h.id === undefined || !boQua.has(h.id));
+
+  const tran = params.tranLichSu ?? 0;
+  return tran > 0 ? conLai.slice(-tran) : conLai;
+}
+
+/** Gộp toàn bộ ảnh + text trong batch thành content của 1 lượt user */
+export async function buildCurrentTurnContent(
+  batch: ParsedMessage[],
+  imageMode: ImageContextMode,
+): Promise<UserContent> {
+  const parts: Exclude<UserContent, string> = [];
+  let totalImages = 0;
+
+  for (const msg of batch) {
+    for (const image of msg.images) {
+      totalImages++;
+      // blind: không tải, không đính - chỉ chèn 1 ghi chú tổng ở dưới
+      if (imageMode === "blind") continue;
+
+      // Ảnh đã persist trước đó (message-turn-processor) thì đọc từ đĩa - không
+      // tải lại; persist lỗi thì rơi về tải thẳng từ URL Zalo như cũ
+      const stored = image.localPath ? loadStoredImage(image.localPath) : null;
+      const downloaded = stored ?? (await downloadImageAsBase64(image.url));
+      if (!downloaded) continue;
+
+      // describe/hybrid: sidecar mô tả (cache theo localPath)
+      if (imageMode === "describe" || imageMode === "hybrid") {
+        const description = await describeImage({ ...downloaded, cacheKey: image.localPath });
+        if (description) {
+          parts.push({ type: "text", text: `[Mô tả ảnh người dùng vừa gửi: ${description}]` });
+        } else if (imageMode === "describe") {
+          // describe mà không mô tả được = model chính hoàn toàn mù ảnh này
+          parts.push({ type: "text", text: DESCRIBE_FAILED_NOTE });
+        }
+        // hybrid không cần note lỗi: pixel vẫn được đính ngay bên dưới
+      }
+
+      if (imageMode === "native" || imageMode === "hybrid") {
+        // Part "file" thay cho "image": kiểu image bị AI SDK v7 đánh dấu
+        // deprecated (in cảnh báo mỗi ảnh) và sẽ xóa ở bản sau
+        parts.push({ type: "file", data: downloaded.base64, mediaType: downloaded.mediaType });
+      }
+    }
+  }
+
+  if (imageMode === "blind" && totalImages > 0) {
+    parts.push({ type: "text", text: blindImageNote(totalImages) });
+  }
+
+  parts.push({ type: "text", text: dongTinCuaLuot(batch) });
+
+  return parts;
+}

@@ -1,0 +1,34 @@
+node_modules/
+dist/
+logs/
+
+# Runtime data: SQLite db, cookie Zalo (credential!), file tải về
+data/
+
+# Env thật không bao giờ commit
+.env
+.env.*
+!.env.example
+!.env.production.example
+
+# Cấu hình account thật (chứa user id, persona riêng)
+config/accounts.json
+
+# QR login tạm
+qr*.png
+
+# Cấu hình MCP server của máy dev (đường dẫn tuyệt đối, có thể chứa token)
+.mcp.json
+
+# Ghi chú riêng của người vận hành: IP máy chủ, cổng SSH, tên miền, đường dẫn.
+# Repo này công khai nên hạ tầng cá nhân KHÔNG lên GitHub. Tài liệu triển khai
+# chung (dùng chỗ trống thay cho giá trị thật) nằm ở docs/deployment-guide.md.
+*.local.md
+
+# Scratch của quy trình thực thi kế hoạch (ledger, review package) - không phải mã nguồn
+.superpowers/
+
+# Trạng thái phiên của Claude Code trên máy
+.claude/session-state/
+# Script do một lần của agent (đọc log thật), không đưa vào repo
+.claude/do-*.ts

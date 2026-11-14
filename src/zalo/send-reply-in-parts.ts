@@ -1,0 +1,354 @@
+import type { API, SendMessageQuote, Style, ThreadType } from "zca-js";
+import { enqueueSend } from "../middleware/rate-limiter.js";
+import { createLogger } from "../shared/logger.js";
+import { trichDanTrongNganSach } from "./reply-quote.js";
+import { chiaTheoNganSachByte, demDoanBoDinhDang } from "./split-styled-message.js";
+import { getTuning } from "../config/runtime-tuning-settings.js";
+
+/**
+ * Gửi câu trả lời của agent xuống Zalo, cắt thành nhiều tin khi quá dài.
+ *
+ * Zalo chặn tin dài ở phía server (error_code 118 "Nội dung quá dài") và zca-js
+ * ném thẳng lỗi lên - trước đây cả câu trả lời biến mất không dấu vết. Giờ cắt
+ * theo ranh giới tự nhiên rồi gửi tuần tự qua rate-limiter (mỗi tin có delay
+ * ngẫu nhiên sẵn nên chuỗi tin trông như người gõ nhiều dòng, không phải bot xả).
+ */
+
+const log = createLogger("send-reply");
+
+/**
+ * Câu trả lời khi bot hỏng giữa chừng. Im lặng bỏ treo người nhắn là hành vi
+ * tệ nhất: họ không biết nên chờ hay nhắn lại.
+ */
+export const TECHNICAL_ERROR_REPLY =
+  "Mình đang gặp trục trặc kỹ thuật nên chưa trả lời được tin này, bạn nhắn lại giúp mình sau ít phút nhé.";
+
+/**
+ * Câu riêng cho từng loại lỗi provider.
+ *
+ * Một câu cho mọi thứ là nói dối người nhắn: "bot hết quota" và "mạng chập" đọc
+ * ra y hệt nhau, nên họ không biết nên chờ hay báo cho chủ bot.
+ *
+ * Cả ba câu đều viết bằng lời thường, KHÔNG lộ chi tiết kỹ thuật (mã lỗi, tên
+ * provider, endpoint) - người nhắn có thể là người lạ, chi tiết chỉ đi vào log.
+ */
+export const LOI_THEO_LOAI: Record<string, string> = {
+  rate_limit:
+    "Mình đang bị quá tải nên chưa trả lời kịp tin này, bạn nhắn lại giúp mình sau vài phút nhé.",
+  // Đây là lỗi CẤU HÌNH, chờ bao lâu cũng không tự hết - phải nói khác hẳn
+  // câu "thử lại sau", kẻo người nhắn ngồi đợi vô vọng.
+  auth: "Phần kết nối của mình đang có vấn đề về cấu hình, mình đã báo lại cho chủ bot. Bạn nhắn lại sau nhé.",
+  // Khác `auth` ở chỗ chưa nhập gì cả, chứ không phải nhập sai. Người nhắn
+  // không cần biết chi tiết đó, nhưng câu phải nói rõ là CHƯA DÙNG ĐƯỢC chứ
+  // không phải trục trặc thoáng qua - nếu không họ sẽ nhắn lại mỗi vài phút.
+  cau_hinh:
+    "Bot mình chưa được cài đặt xong nên chưa trả lời được. Mình đã báo cho chủ bot, bạn quay lại sau nhé.",
+};
+
+/** Câu hợp với loại lỗi; loại lạ thì rơi về câu chung */
+export function cauLoiTheoLoai(loai: string | undefined): string {
+  return (loai && LOI_THEO_LOAI[loai]) || TECHNICAL_ERROR_REPLY;
+}
+
+/** Một đoạn đã cắt sẵn, chuẩn bị gửi xuống kênh */
+export type DoanCanGui = {
+  text: string;
+  styles?: Style[];
+  quote?: SendMessageQuote;
+};
+
+export type ReplyTarget = {
+  /**
+   * Gửi MỘT đoạn. Mỗi kênh tự cung cấp cách gửi của mình - đây là ranh giới
+   * DUY NHẤT giữa logic cắt/chữa lỗi ở file này và API thật của kênh.
+   *
+   * Trước đây trường này là `api: API` của zca-js, tức cả đường gửi khóa cứng
+   * vào một kênh. Kênh bot (Zalo Bot API) có hình dạng khác hẳn: `sendMessage`
+   * nhận `(chat_id, text)` và server tự dựng markdown, không có `styles` lẫn
+   * `quote`. Dựng đường gửi bằng `duongGuiZcaJs()` cho kênh cá nhân.
+   */
+  guiMotDoan: (doan: DoanCanGui) => Promise<unknown>;
+  /**
+   * Trần độ dài MỘT tin của kênh này; thiếu thì dùng `ZALO_MAX_MESSAGE_CHARS`.
+   * Xem `KenhLuot.tranKyTuMotTin` cho lý do phải tách theo kênh.
+   */
+  tranKyTuMotTin?: number;
+  /**
+   * Kênh này có mang được định dạng không; thiếu = CÓ. Xem
+   * `KenhLuot.mangDinhDang` cho lý do đầy đủ.
+   */
+  mangDinhDang?: boolean;
+  /** Khóa hàng đợi gửi của rate-limiter: `${accountId}:${threadId}` */
+  threadKey: string;
+  threadId: string;
+  threadType: ThreadType;
+  /**
+   * Tin được trích dẫn khi trả lời (chỉ nhóm - xem `reply-quote.ts`). Chỉ ĐOẠN
+   * ĐẦU của câu trả lời mang nó: các đoạn sau là phần nối tiếp của cùng một
+   * câu, trích lại ở mỗi đoạn chỉ tổ rối. goclaw cũng gỡ `reply_to_message_id`
+   * khỏi các tin trung gian, giữ lại đúng tin chốt.
+   *
+   * Đường gửi của scheduler dùng chung `ReplyTarget` nhưng không đặt trường này
+   * - job theo lịch không trả lời tin nào cả.
+   */
+  quote?: SendMessageQuote;
+};
+
+export type ReplyResult = {
+  /** Phần đã gửi được thật sự - ghi vào history đúng cái người dùng nhìn thấy */
+  deliveredText: string;
+  /** Số tin đã gửi */
+  sentParts: number;
+  /** Lỗi ở tin đầu tiên gửi hỏng (nếu có) - caller quyết định báo cho người dùng */
+  error?: unknown;
+};
+
+/**
+ * Gửi 1 tin qua hàng đợi của thread (giữ thứ tự + delay ngẫu nhiên).
+ *
+ * Chỉ đính `styles` khi thật sự có - `sendMessage` của zca-js chỉ dựng
+ * `textProperties` khi trường này khác rỗng, gửi mảng rỗng là thêm việc thừa.
+ * Cùng lý do với `quote`: có trích dẫn thì zca-js đổi hẳn sang endpoint
+ * `.../quote`, nên đính một giá trị rỗng là đổi đường gọi API mà không được gì.
+ */
+function sendOne(
+  target: ReplyTarget,
+  text: string,
+  styles?: Style[],
+  quote?: SendMessageQuote,
+): Promise<unknown> {
+  return enqueueSend(target.threadKey, () => target.guiMotDoan({ text, styles, quote }));
+}
+
+/**
+ * Đường gửi cho kênh TÀI KHOẢN CÁ NHÂN (zca-js).
+ *
+ * Chỉ đính `styles` khi thật sự có - `sendMessage` của zca-js chỉ dựng
+ * `textProperties` khi trường này khác rỗng, gửi mảng rỗng là thêm việc thừa.
+ * Cùng lý do với `quote`: có trích dẫn thì zca-js đổi hẳn sang endpoint
+ * `.../quote`, nên đính một giá trị rỗng là đổi đường gọi API mà không được gì.
+ *
+ * Gom vào một nhà máy thay vì để mỗi chỗ dựng `ReplyTarget` tự viết: ba chỗ tự
+ * viết là ba cơ hội quên một trong hai luật trên, mà quên thì hỏng câm.
+ */
+export function duongGuiZcaJs(
+  api: API,
+  threadId: string,
+  threadType: ThreadType,
+): (doan: DoanCanGui) => Promise<unknown> {
+  return ({ text, styles, quote }) =>
+    api.sendMessage(
+      {
+        msg: text,
+        ...(styles && styles.length > 0 ? { styles } : {}),
+        ...(quote ? { quote } : {}),
+      },
+      threadId,
+      threadType,
+    );
+}
+
+/**
+ * Máy chủ Zalo có TRẢ LỜI và từ chối, hay là lỗi đường truyền không rõ kết cục?
+ *
+ * Phân biệt được điều này mới dám gửi lại: máy chủ đã từ chối nghĩa là KHÔNG có
+ * tin nào lọt qua, gửi lại là an toàn. Còn timeout hay đứt mạng thì tin có thể
+ * đã tới nơi - gửi lại là nhân đôi tin trước mặt người dùng.
+ *
+ * Dấu hiệu: zca-js gắn `code` dạng số cho lỗi do máy chủ trả về
+ * (`ZaloApiError`), lỗi mạng thì không có.
+ */
+export function laLoiMayChuTuChoi(err: unknown): boolean {
+  return typeof (err as { code?: unknown } | null)?.code === "number";
+}
+
+/**
+ * Gửi một đoạn; bị máy chủ từ chối thì thử lại đúng MỘT lần, bỏ định dạng.
+ *
+ * Vì sao cần: 2026-08-05 một câu trả lời có tiêu đề kèm in đậm sinh ra hai span
+ * `b` chồng nhau, Zalo trả mã 112 và người dùng mất trọn câu trả lời sau 8 lượt
+ * tra web. `chuanHoaStyles` đã bịt đúng ca đó, nhưng luật kiểm của Zalo là hộp
+ * đen - không có cách nào liệt kê cho đủ. Nên thay vì đoán cho hết, hạ mức hậu
+ * quả: tổ hợp style lạ chỉ còn làm tin NHẠT ĐI, không làm mất nội dung.
+ *
+ * Chỉ thử lại khi thật sự CÓ thứ để bỏ (style hoặc trích dẫn) - không thì lần
+ * hai y hệt lần đầu và chỉ tổ nhân đôi một lời gọi API không chính thức.
+ *
+ * Lần thử lại bỏ CẢ HAI. Không cố đoán bên nào là thủ phạm: ở nhánh này mục
+ * tiêu duy nhất còn lại là chữ TỚI NƠI, mà mỗi lần đoán sai là thêm một lời gọi
+ * nữa. Trích dẫn cũng là ứng viên thật chứ không phải bịa - có nó thì zca-js
+ * gọi sang endpoint `.../quote` khác hẳn, và phần `qmsg` cộng thêm vào payload.
+ */
+async function sendOneCoDuongLui(
+  target: ReplyTarget,
+  text: string,
+  styles: Style[],
+  quote?: SendMessageQuote,
+): Promise<unknown> {
+  try {
+    return await sendOne(target, text, styles, quote);
+  } catch (err) {
+    const coCaiDeBo = styles.length > 0 || quote !== undefined;
+    if (!coCaiDeBo || !laLoiMayChuTuChoi(err)) throw err;
+
+    // WARN chứ không debug: mất định dạng là hỏng thầm lặng, người vận hành
+    // phải thấy được để còn lần ra tổ hợp style nào bị Zalo chê.
+    log.warn(
+      { threadId: target.threadId, soStyle: styles.length, coTrichDan: quote !== undefined, err },
+      "Zalo từ chối tin - gửi lại dạng chữ trơn, không định dạng và không trích dẫn",
+    );
+    return await sendOne(target, text);
+  }
+}
+
+/**
+ * Cắt (nếu cần) rồi gửi lần lượt. Một tin hỏng thì dừng luôn phần còn lại -
+ * gửi tiếp các đoạn sau sẽ ra một câu trả lời thủng lỗ chỗ, khó đọc hơn là
+ * dừng và báo lỗi.
+ *
+ * `styles` tính trên TOÀN VĂN nên phải chẻ theo đúng chỗ cắt - việc đó nằm ở
+ * `splitStyledMessage`, không tự làm ở đây.
+ */
+export async function sendReplyInParts(
+  target: ReplyTarget,
+  text: string,
+  styles: Style[] = [],
+): Promise<ReplyResult> {
+  // Kênh không mang định dạng (Bot API) thì `styles` sẽ bị đường gửi vứt ở
+  // phút chót. Vứt Ở ĐÂY, TRƯỚC bộ cắt, vì hai lý do:
+  //
+  // 1. `soByteTin` cộng cả `JSON.stringify({styles})` vào ngân sách byte - giữ
+  //    lại là tính tiền cho thứ không bao giờ đi trên dây, và chẻ thừa tin.
+  // 2. `sendOneCoDuongLui` bên dưới quyết định có thử lại hay không dựa vào
+  //    `styles.length > 0`. Trên kênh bot, gửi lại "không định dạng" là gửi
+  //    lại Y HỆT (styles vốn đã bị vứt) - tốn thêm một lời gọi API mà không
+  //    đổi được gì. Hôm nay nhánh đó không chạy vì `laLoiMayChuTuChoi` đọc
+  //    `err.code` dạng số của `ZaloApiError` còn `LoiZaloBotApi` mang
+  //    `httpStatus`/`maLoi` - tức nó đúng một cách TÌNH CỜ. Ai "dọn dẹp"
+  //    `laLoiMayChuTuChoi` cho hiểu `LoiZaloBotApi` sẽ bật ra lời gọi thừa đó;
+  //    dòng dưới đóng cửa ấy lại bằng lý do tường minh.
+  //
+  // Đặt ở đây (MỘT chỗ) chứ không ở từng caller (`deliver-chat-reply` và
+  // `scheduled-job-send`): hai chỗ là hai cơ hội quên. Chữ đã được BÓC
+  // markdown ở tầng trên (`dinhDangNeuBat`) nên không mất gì.
+  if (target.mangDinhDang === false) styles = [];
+  // Trích dẫn ăn vào CÙNG ngân sách byte với chữ của bot, mà bộ cắt không biết
+  // gì về nó - phải trừ trước rồi mới cắt. Quá dài thì bỏ hẳn trích dẫn: mất
+  // một khối trang trí còn hơn để Zalo chối cả tin.
+  const trichDan = trichDanTrongNganSach(
+    target.quote,
+    getTuning("ZALO_RICH_TEXT_MAX_PAYLOAD_BYTES"),
+  );
+  if (trichDan.boViQuaDai) {
+    log.warn(
+      { threadId: target.threadId },
+      "Tin được trích dẫn quá dài so với ngân sách byte - trả lời không kèm trích dẫn",
+    );
+  }
+
+  const parts = chiaTheoNganSachByte(
+    { text, styles },
+    {
+      // Trần của KÊNH thắng trần chung khi kênh có khai. Bot API ép cứng 2000
+      // ký tự phía server (đo thật), còn ZALO_MAX_MESSAGE_CHARS chỉnh được tới
+      // 4000 - dùng chung một con số thì ai nới cho kênh cá nhân là kênh bot
+      // mất trọn câu trả lời vì server chối nguyên tin.
+      maxChars: target.tranKyTuMotTin ?? getTuning("ZALO_MAX_MESSAGE_CHARS"),
+      maxParts: getTuning("ZALO_MAX_MESSAGE_PARTS"),
+      maxPayloadBytes: trichDan.tranConLai,
+    },
+  );
+
+  if (parts.length === 0) return { deliveredText: "", sentParts: 0 };
+
+  if (parts.length > 1) {
+    log.info(
+      { threadId: target.threadId, length: text.length, parts: parts.length },
+      "Câu trả lời dài - cắt thành nhiều tin",
+    );
+  }
+
+  // Bộ cắt có quyền bỏ định dạng của một đoạn khi co hết cỡ vẫn không lọt ngân
+  // sách byte. Nhánh đó phải KÊU LÊN: bản đầu làm việc này lặng lẽ, và lỗi chỉ
+  // lộ ra vì người dùng nhìn thấy tin đầu phẳng lì - log không hề nhắc gì.
+  // Đếm theo CỜ, không theo `styles.length === 0`: đoạn cuối thường chỉ là văn
+  // xuôi nên vốn không có span nào, mà suy ra từ độ dài thì đó là báo động giả.
+  const doanMatDinhDang = demDoanBoDinhDang(parts);
+  if (doanMatDinhDang > 0) {
+    log.warn(
+      { threadId: target.threadId, doanMatDinhDang, tongDoan: parts.length },
+      "Đoạn quá nặng so với trần byte của Zalo - gửi đoạn đó dạng chữ trơn",
+    );
+  }
+
+  const delivered: string[] = [];
+  for (const part of parts) {
+    try {
+      // Chỉ đoạn ĐẦU trích dẫn: các đoạn sau là phần nối tiếp của cùng một câu
+      // trả lời, trích lại ở mỗi đoạn thì khối trích dẫn lặp đầy màn hình
+      await sendOneCoDuongLui(target, part.text, part.styles, delivered.length === 0 ? trichDan.quote : undefined);
+      delivered.push(part.text);
+    } catch (err) {
+      log.error(
+        { threadId: target.threadId, partIndex: delivered.length + 1, total: parts.length, err },
+        "Gửi tin thất bại",
+      );
+      return { deliveredText: delivered.join("\n"), sentParts: delivered.length, error: err };
+    }
+  }
+
+  return { deliveredText: delivered.join("\n"), sentParts: delivered.length };
+}
+
+/**
+ * Lần cuối đã báo lỗi cho mỗi (thread + loại lỗi).
+ *
+ * Map sống suốt đời process nhưng KHÔNG rò rỉ đáng kể: khóa chỉ sinh ra khi có
+ * lỗi thật, và mỗi thread nhiều nhất vài loại. Một bot chat với hàng nghìn
+ * người mà lỗi ở cả nghìn thread thì bộ nhớ của Map này là chuyện nhỏ nhất.
+ */
+const lanBaoLoiCuoi = new Map<string, number>();
+
+/**
+ * Khoảng lặng giữa hai lần báo CÙNG một loại lỗi cho CÙNG một thread.
+ *
+ * Vì sao cần: provider chết 10 phút mà người ta nhắn 5 lần là 5 tin y hệt nhau
+ * đổ xuống - vừa phiền vừa làm họ tưởng bot hỏng nặng hơn thực tế. Một lần đã
+ * nói đủ ý "chờ rồi nhắn lại".
+ *
+ * Khóa gồm CẢ loại lỗi, không chỉ thread: "bot chưa cấu hình xong" và "mạng
+ * chập" là hai chuyện khác nhau và mỗi chuyện đáng được nói một lần. Nuốt câu
+ * thứ hai vì câu thứ nhất vừa gửi là giấu đúng thông tin người ta cần.
+ */
+const KHOANG_LANG_BAO_LOI_MS = 60_000;
+
+/**
+ * Báo cho người nhắn biết bot đang hỏng. Tự nuốt lỗi: đây đã là đường cứu cánh,
+ * hỏng nốt thì chỉ còn cách ghi log.
+ *
+ * Bỏ qua nếu vừa báo đúng loại lỗi này cho thread này - xem
+ * `KHOANG_LANG_BAO_LOI_MS`.
+ */
+export async function notifyTechnicalError(target: ReplyTarget, loaiLoi?: string): Promise<void> {
+  const khoa = `${target.threadKey}:${loaiLoi ?? "chung"}`;
+  const lanCuoi = lanBaoLoiCuoi.get(khoa) ?? 0;
+  const bayGio = Date.now();
+  if (bayGio - lanCuoi < KHOANG_LANG_BAO_LOI_MS) {
+    log.debug({ threadId: target.threadId, loaiLoi }, "Vừa báo lỗi này rồi - không gửi lại");
+    return;
+  }
+  // Đánh dấu TRƯỚC khi gửi: gửi là việc async, hai lượt hỏng gần nhau có thể
+  // cùng đi qua chỗ kiểm ở trên rồi cùng gửi. Đánh dấu sau thì cửa sổ đó vẫn hở.
+  lanBaoLoiCuoi.set(khoa, bayGio);
+
+  try {
+    await sendOne(target, cauLoiTheoLoai(loaiLoi));
+  } catch (err) {
+    log.error({ threadId: target.threadId, err }, "Không gửi được cả thông báo lỗi");
+  }
+}
+
+/** Xóa bộ nhớ khử trùng - chỉ test dùng, để các ca không ảnh hưởng lẫn nhau */
+export function resetKhuTrungBaoLoi(): void {
+  lanBaoLoiCuoi.clear();
+}

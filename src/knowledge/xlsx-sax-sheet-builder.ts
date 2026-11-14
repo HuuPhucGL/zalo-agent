@@ -1,0 +1,216 @@
+import type { SaxesTagNS } from "saxes";
+import type { XmlSaxHandlers } from "../shared/xml-sax-scan.js";
+import { thayTheEscapeExcel } from "./xlsx-sax-shared-strings.js";
+import { LoiVuotTran, TRAN_SO_COT_EXCEL, TRAN_TONG_KY_TU_TRICH, TRAN_TONG_SO_O } from "./ooxml-limits.js";
+
+/**
+ * Sổ ngân sách dùng CHUNG cho MỌI sheet của cùng 1 file xlsx -
+ * `extract-xlsx-text.ts` tạo MỘT lần, truyền vào từng `taoXlsxSheetSaxBuilder()`
+ * (như `zip-stream-entry.ts` dùng 1 phiên cho trần tổng). KHÔNG dùng biến
+ * module-level: mỗi `docChuTuFile` cần bộ riêng.
+ *
+ * HAI trục, cả hai đều phải dùng chung - chia nhỏ ra nhiều sheet, mỗi sheet
+ * dưới trần, KHÔNG được lách trần tổng:
+ * - `tongO`: CÔNG CẤP PHÁT (ô thật + ô đệm do cột nhảy cóc) - `TRAN_TONG_SO_O`.
+ * - `tongKyTu`: CHỮ THẬT đã gom vào kết quả - `TRAN_TONG_KY_TU_TRICH`.
+ *
+ * `tongKyTu` từng nằm TRONG thân builder (một biến cục bộ, khởi tạo lại mỗi
+ * sheet) nên trần 8 MB hoá ra là trần MỖI SHEET. `sharedStrings` khuếch đại ca
+ * này: một chuỗi dùng chung 100.000 ký tự, mỗi ô `<c t="s"><v>0</v></c>` chỉ
+ * ~25 byte XML nhưng trả về TRỌN chuỗi đó. Đo được: 12 sheet x 83 ô (file
+ * .xlsx 3,9 KB, 13 entry, 996 ô - dưới MỌI trần zip/entry/số ô) trích ra 95,0
+ * MB chữ trong 71 ms mà không trần nào bắt; 250 sheet thì `node
+ * --max-old-space-size=384` chết FATAL heap limit. `KB_EXTRACT_TIMEOUT_MS`
+ * cũng không cứu được: 250 sheet chỉ tốn ~2,5 giây.
+ */
+export type NganSachO = { tongO: number; tongKyTu: number };
+
+/** `xl/worksheets/sheetN.xml` -> chữ theo HÀNG (một hàng là một bản ghi có
+ * nghĩa). Thay `ROW_RE`/`CELL_RE`/`V_RE` cũ - xem mục 1.3, 3.2 nghiên cứu. */
+
+const SPREADSHEETML_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+
+function giaTriThuocTinh(tag: SaxesTagNS, localName: string): string | undefined {
+  for (const key in tag.attributes) {
+    if (tag.attributes[key]?.local === localName) return tag.attributes[key]!.value;
+  }
+  return undefined;
+}
+
+/** "B" -> 2, "AA" -> 27 (chỉ số cột 1-based, kiểu Excel). */
+function chuCotThanhChiSo(chuCai: string): number {
+  let idx = 0;
+  for (const c of chuCai) idx = idx * 26 + (c.charCodeAt(0) - 64); // 'A' = 65
+  return idx;
+}
+
+export type XlsxSheetSaxBuilder = XmlSaxHandlers & {
+  layCacDong(): string[];
+};
+
+/**
+ * @param chuoiDungChung mảng `sharedStrings.xml` theo ĐÚNG thứ tự index
+ * @param nganSachO sổ ngân sách (số ô + số ký tự trích ra) DÙNG CHUNG với các
+ * sheet khác trong cùng file - xem `NganSachO`. KHÔNG được thay bằng biến cục
+ * bộ trong thân hàm này: builder được tạo LẠI cho mỗi sheet nên biến cục bộ
+ * biến trần tổng thành trần mỗi sheet.
+ */
+export function taoXlsxSheetSaxBuilder(
+  chuoiDungChung: readonly string[],
+  nganSachO: NganSachO,
+): XlsxSheetSaxBuilder {
+  const cacDong: string[] = [];
+
+  let dongHienTai: string[] = [];
+  let cotKyVong = 1; // chỉ số cột (1-based) mong đợi ô KẾ TIẾP sẽ nằm ở đó
+
+  let kieuO: string | undefined; // thuộc tính t= của <c> đang mở
+  let chiSoCotHienTai = 1;
+  let boDemV = "";
+  let boDemIs = "";
+  let dangTrongV = false;
+  let dangTrongF = false; // <f>...</f> là CÔNG THỨC, không phải giá trị - luôn bỏ qua
+  let dangTrongIs = false;
+  let dangTrongTTrongIs = false;
+  let doSauRPh = 0; // phiên âm furigana trong <is> - loại như sharedStrings
+
+  function giaTriOTheoLoai(): string {
+    if (kieuO === "s") {
+      // Ô t="s" nhưng KHÔNG có <v> (hoặc <v></v> rỗng) - boDemV === "" thì
+      // Number("") === 0, LỘ RA chuỗi tại index 0 của người khác thay vì ô
+      // rỗng. Đã đo: '<c t="s"><v>1</v></c><c t="s"></c>' ra "That | BI-MAT" -
+      // ô B trống bịa ra chữ của ô A. Phải kiểm rỗng TRƯỚC khi Number().
+      if (boDemV.trim() === "") return "";
+      return thayTheEscapeExcel(chuoiDungChung[Number(boDemV)] ?? "");
+    }
+    if (kieuO === "inlineStr") return thayTheEscapeExcel(boDemIs);
+    if (kieuO === "str") return thayTheEscapeExcel(boDemV); // kết quả công thức dạng chữ
+    if (kieuO === "b") return boDemV === "1" ? "Đúng" : "Sai";
+    return boDemV; // "e" (lỗi công thức), hoặc không khai t= (số thường)
+  }
+
+  /**
+   * Chèn ô rỗng cho cột bị nhảy cóc - không thì ô sau dính sát ô trước, lệch
+   * cột. Đếm CÔNG CẤP PHÁT (ô đệm + chính ô này) TRƯỚC vòng lặp `push`, bất
+   * kể hàng có chữ hay không: hàng toàn ô rỗng bị lọc bỏ ở `</row>` TRƯỚC khi
+   * cộng vào `nganSachO.tongKyTu`, nên `TRAN_TONG_KY_TU_TRICH` không bắt được
+   * ca này.
+   */
+  function themOVaoDong(giaTri: string, chiSoCot: number): void {
+    // Math.max(1, ...) - KHÔNG BAO GIỜ hoàn quỹ. `dongHienTai` reset mỗi
+    // <row> nhưng `nganSachO.tongO` thì KHÔNG (cố ý, dùng chung cả sheet) -
+    // để hiệu ÂM cộng thẳng vào (ô cột THẤP đứng SAU ô cột CAO cùng hàng, vd
+    // <c r="XFD1"/><c r="A1"/>) thì một khoản "hoàn quỹ" giả xoá sạch chi phí
+    // CPU thật của push vừa chạy khỏi sổ. Đã đo: 100.000 hàng hình dạng đó
+    // chạy đủ 20 giây mà KHÔNG trần nào bắt (tongO cuối chỉ = 100.000, mỗi
+    // hàng "net" +1 dù tốn 16.383 lần push CPU). Kẹp sàn 1: mỗi lần gọi
+    // charge = max(1, số push thật + 1) >= số push thật, nên tongO tích luỹ
+    // LUÔN là biên trên của tổng push CPU thật - không thể lách bằng bất kỳ
+    // thứ tự cột nào.
+    const soOThemVao = Math.max(1, chiSoCot - dongHienTai.length);
+    nganSachO.tongO += soOThemVao;
+    if (nganSachO.tongO > TRAN_TONG_SO_O) {
+      throw new LoiVuotTran(
+        `File xlsx có quá nhiều ô để xử lý (kể cả ô trống do cột nhảy cóc), vượt quá giới hạn ${TRAN_TONG_SO_O.toLocaleString("vi-VN")} ô. Hãy rút gọn bảng tính hoặc tách thành nhiều file nhỏ hơn.`,
+      );
+    }
+    while (dongHienTai.length < chiSoCot - 1) dongHienTai.push("");
+    dongHienTai[chiSoCot - 1] = giaTri;
+    cotKyVong = chiSoCot + 1;
+  }
+
+  function chiSoCotCua(tag: SaxesTagNS): number {
+    const chuCai = giaTriThuocTinh(tag, "r")?.match(/^[A-Za-z]+/)?.[0];
+    // Ô không r= thừa kế cotKyVong - kẹp CÙNG trần XFD như nhánh có r= dưới
+    // đây, không thì chuỗi ô không r= sau XFD1 đẩy cotKyVong vượt 16.384.
+    if (!chuCai) return Math.min(cotKyVong, TRAN_SO_COT_EXCEL);
+    const chiSo = chuCotThanhChiSo(chuCai.toUpperCase());
+    // BẮT BUỘC kẹp: cột thật tối đa của Excel là XFD = 16.384. Không kẹp thì
+    // themOVaoDong() cấp phát mảng theo chiSo KHÔNG TRẦN - r="AAAAAAA1" (7
+    // chữ cái) ra hơn 321 TRIỆU, khiến vòng lặp lấp cột cấp một mảng 321
+    // triệu phần tử -> OOM FATAL của V8 (giết hẳn process, không try/catch
+    // bắt được). Không trần zip/entry/tổng/độ-sâu nào ở trên bắt được ca này.
+    if (chiSo > TRAN_SO_COT_EXCEL) {
+      throw new LoiVuotTran(
+        `File xlsx có ô ở cột vượt quá giới hạn thật của Excel (cột tối đa là XFD, tức ${TRAN_SO_COT_EXCEL}) - nghi ngờ file bị chỉnh sửa bất thường`,
+      );
+    }
+    return chiSo;
+  }
+
+  const moThe: XmlSaxHandlers["moThe"] = (tag) => {
+    if (tag.uri !== SPREADSHEETML_NS) return;
+    switch (tag.local) {
+      case "row":
+        dongHienTai = [];
+        cotKyVong = 1;
+        break;
+      case "c":
+        kieuO = giaTriThuocTinh(tag, "t");
+        chiSoCotHienTai = chiSoCotCua(tag);
+        boDemV = "";
+        boDemIs = "";
+        if (tag.isSelfClosing) themOVaoDong("", chiSoCotHienTai); // ô có định dạng nhưng rỗng
+        break;
+      case "v":
+        dangTrongV = true;
+        break;
+      case "f":
+        dangTrongF = true;
+        break;
+      case "is":
+        dangTrongIs = true;
+        break;
+      case "rPh":
+        if (dangTrongIs) doSauRPh++;
+        break;
+      case "t":
+        if (dangTrongIs && doSauRPh === 0) dangTrongTTrongIs = true;
+        break;
+    }
+  };
+
+  const dongThe: XmlSaxHandlers["dongThe"] = (tag) => {
+    if (tag.uri !== SPREADSHEETML_NS) return;
+    switch (tag.local) {
+      case "row":
+        if (dongHienTai.some((o) => o.trim())) {
+          const dong = dongHienTai.join(" | ");
+          nganSachO.tongKyTu += dong.length;
+          if (nganSachO.tongKyTu > TRAN_TONG_KY_TU_TRICH) {
+            throw new LoiVuotTran(
+              `Chữ trích ra từ file vượt quá giới hạn ${TRAN_TONG_KY_TU_TRICH / (1024 * 1024)} MB (tính cho CẢ file, cộng mọi sheet). Hãy tách bảng tính thành nhiều file nhỏ hơn rồi nạp thành nhiều nguồn.`,
+            );
+          }
+          cacDong.push(dong);
+        }
+        break;
+      case "c":
+        if (!tag.isSelfClosing) themOVaoDong(giaTriOTheoLoai(), chiSoCotHienTai);
+        break;
+      case "v":
+        dangTrongV = false;
+        break;
+      case "f":
+        dangTrongF = false;
+        break;
+      case "is":
+        dangTrongIs = false;
+        break;
+      case "rPh":
+        if (dangTrongIs) doSauRPh--;
+        break;
+      case "t":
+        dangTrongTTrongIs = false;
+        break;
+    }
+  };
+
+  const chuVanBan: XmlSaxHandlers["chuVanBan"] = (text) => {
+    if (dangTrongF) return; // <f> luôn bỏ qua - chuỗi công thức, không phải giá trị
+    if (dangTrongV) boDemV += text;
+    else if (dangTrongTTrongIs) boDemIs += text;
+  };
+
+  return { moThe, dongThe, chuVanBan, layCacDong: () => cacDong };
+}

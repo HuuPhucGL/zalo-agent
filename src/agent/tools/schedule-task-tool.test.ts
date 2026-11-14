@@ -1,0 +1,631 @@
+import assert from "node:assert/strict";
+import { ketQuaThanhCong, loiCuaTool } from "./tool-failure-result-test-helper.js";
+import { after, before, describe, it } from "node:test";
+import { DateTime } from "luxon";
+import type { API } from "zca-js";
+import { fakeAgentProfile } from "../../shared/fake-agent-profile.js";
+import { cleanupTestEnv, setupTestEnv } from "../../shared/test-env-setup.js";
+import type { ParsedMessage } from "../../zalo/zalo-message-parser.js";
+
+// Mốc "once" phải luôn ở TƯƠNG LAI so với giờ chạy test thật (parseSchedule từ
+// chối mốc quá khứ) - +7 ngày cách xa hiện tại đủ để không tự "hết hạn" theo
+// thời gian, khác bản cũ hardcode "2026-08-01" từng tự rơi vào quá khứ đúng
+// ngày đó và làm test đỏ vĩnh viễn từ hôm sau.
+const ONCE_TEST_MOMENT = DateTime.now()
+  .setZone("Asia/Ho_Chi_Minh")
+  .plus({ days: 7 })
+  .set({ minute: 0, second: 0, millisecond: 0 });
+const ONCE_TEST_DATE = ONCE_TEST_MOMENT.toFormat("yyyy-LL-dd");
+const ONCE_TEST_TIME = ONCE_TEST_MOMENT.toFormat("HH:mm");
+const ONCE_TEST_DATE_VN = ONCE_TEST_MOMENT.toFormat("dd/LL/yyyy");
+const ONCE_TEST_RUN_AT_UTC = ONCE_TEST_MOMENT.toUTC().toJSDate().toISOString();
+
+// Kéo theo env + DB nên phải setupTestEnv trước, import động sau
+let dataDir: string;
+let toolModule: typeof import("./schedule-task-tool.js");
+let store: typeof import("../../scheduler/scheduled-job-store.js");
+let tuning: typeof import("../../config/runtime-tuning-settings.js");
+let database: typeof import("../../conversation/database.js");
+type ToolContext = import("./tool-registry.js").ToolContext;
+
+before(async () => {
+  dataDir = setupTestEnv();
+  toolModule = await import("./schedule-task-tool.js");
+  store = await import("../../scheduler/scheduled-job-store.js");
+  tuning = await import("../../config/runtime-tuning-settings.js");
+  database = await import("../../conversation/database.js");
+});
+
+after(() => {
+  database.closeDatabase();
+  cleanupTestEnv(dataDir);
+});
+
+function msg(overrides: Partial<ParsedMessage> = {}): ParsedMessage {
+  return {
+    accountId: "acc-1",
+    threadId: "t-1",
+    threadType: 1,
+    isGroup: true,
+    senderId: "u-1",
+    senderName: "Khoa",
+    text: "",
+    images: [],
+    msgId: "m1",
+    cliMsgId: "c1",
+    isSelf: false,
+    mentionsMe: true,
+    sentAt: new Date().toISOString(),
+    rawData: {},
+    ...overrides,
+  };
+}
+
+function makeCtx(overrides: Partial<ToolContext> = {}): ToolContext {
+  return {
+    api: {} as API,
+    account: {
+      id: "acc-1",
+      label: "Test",
+      enabled: true,
+      loai: "ca_nhan" as const,
+      coBotToken: false,
+      agentId: "agent-test",
+      allowlist: { mode: "all" as const, userIds: [] },
+      groupRequireMention: true,
+      respondToGroups: true,
+      groupPassiveListen: true,
+      autoReactEnabled: true,
+      autoReactIcon: "heart",
+      typingIndicatorEnabled: true,
+      disabledTools: [],
+      autoAcceptFriends: false,
+      autoAcceptFriendDelayMinutes: 1,
+    },
+    agent: fakeAgentProfile(),
+    message: msg(),
+    batch: [],
+    ...overrides,
+  };
+}
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+const run = (ctx: ToolContext, input: unknown): Promise<string> =>
+  (toolModule.createScheduleTaskTool(ctx) as any).execute(input, {});
+
+describe("schedule_task - action create", () => {
+  it("once date+time quy đổi đúng UTC (BOT_TIMEZONE mặc định Asia/Ho_Chi_Minh), không phụ thuộc TZ tiến trình", async () => {
+    const originalTz = process.env.TZ;
+    try {
+      for (const tz of ["UTC", "America/New_York"]) {
+        process.env.TZ = tz;
+        const ctx = makeCtx({ message: msg({ threadId: `t-once-${tz}` }) });
+        const result = await run(ctx, {
+          action: "create",
+          name: "Nhắc họp",
+          kind: "message",
+          payload: "Họp với anh Nam",
+          schedule: { kind: "once", date: ONCE_TEST_DATE, time: ONCE_TEST_TIME },
+        });
+
+        const [job] = store.listJobsForThread("acc-1", `t-once-${tz}`);
+        assert.equal(job?.runAt, ONCE_TEST_RUN_AT_UTC, `TZ=${tz} phải ra đúng cùng 1 mốc UTC`);
+        assert.match(
+          result,
+          new RegExp(`${ONCE_TEST_TIME} ngày ${ONCE_TEST_DATE_VN.replace(/\//g, "\\/")}`),
+          "phải đọc lại đúng mốc giờ cho người dùng xác nhận",
+        );
+      }
+    } finally {
+      if (originalTz === undefined) delete process.env.TZ;
+      else process.env.TZ = originalTz;
+    }
+  });
+
+  it("kind='agent' lưu đúng payload là prompt, trả về id để list/cancel sau này dùng", async () => {
+    const ctx = makeCtx({ message: msg({ threadId: "t-agent" }) });
+    const result = await run(ctx, {
+      action: "create",
+      name: "Báo cáo sáng",
+      kind: "agent",
+      payload: "Tóm tắt tin công nghệ nổi bật hôm nay",
+      schedule: { kind: "every", minutes: 60 },
+    });
+
+    const [job] = store.listJobsForThread("acc-1", "t-agent");
+    assert.equal(job?.kind, "agent");
+    assert.equal(job?.payload, "Tóm tắt tin công nghệ nổi bật hôm nay");
+    assert.match(result, new RegExp(job!.id));
+  });
+
+  it("job ghim cứng vào (accountId, threadId) của người tạo - không có tham số đích khác", async () => {
+    const ctx = makeCtx({ message: msg({ threadId: "t-pin", senderId: "u-pin" }) });
+    await run(ctx, {
+      action: "create",
+      name: "x",
+      kind: "message",
+      payload: "y",
+      schedule: { kind: "every", minutes: 30 },
+    });
+
+    const [job] = store.listJobsForThread("acc-1", "t-pin");
+    assert.equal(job?.accountId, "acc-1");
+    assert.equal(job?.threadId, "t-pin");
+    assert.equal(job?.createdBy, "u-pin");
+  });
+
+  it("người NGOÀI allowlist bị từ chối tạo lịch - job không được lưu", async () => {
+    const ctx = makeCtx({
+      account: { ...makeCtx().account, allowlist: { mode: "list", userIds: ["u-duoc-phep"] } },
+      message: msg({ threadId: "t-allowlist-tu-choi", senderId: "u-la" }),
+    });
+
+    const result = await run(ctx, {
+      action: "create",
+      name: "x",
+      kind: "message",
+      payload: "y",
+      schedule: { kind: "every", minutes: 30 },
+    });
+
+    assert.match(loiCuaTool(result), /allowlist|danh sách được phép/i);
+    assert.equal(store.listJobsForThread("acc-1", "t-allowlist-tu-choi").length, 0, "không được tạo job nào");
+  });
+
+  it("người TRONG allowlist tạo được lịch bình thường", async () => {
+    const ctx = makeCtx({
+      account: { ...makeCtx().account, allowlist: { mode: "list", userIds: ["u-duoc-phep"] } },
+      message: msg({ threadId: "t-allowlist-ok", senderId: "u-duoc-phep" }),
+    });
+
+    await run(ctx, {
+      action: "create",
+      name: "x",
+      kind: "message",
+      payload: "y",
+      schedule: { kind: "every", minutes: 30 },
+    });
+
+    assert.equal(store.listJobsForThread("acc-1", "t-allowlist-ok").length, 1);
+  });
+
+  it("chạm trần SCHEDULER_MAX_JOBS_PER_THREAD job đang bật thì bị từ chối", async () => {
+    tuning.setTuning("SCHEDULER_MAX_JOBS_PER_THREAD", 2);
+    try {
+      const ctx = makeCtx({ message: msg({ threadId: "t-cap" }) });
+      const create = (name: string) =>
+        run(ctx, { action: "create", name, kind: "message", payload: "p", schedule: { kind: "every", minutes: 30 } });
+
+      await create("job 1");
+      await create("job 2");
+      const ketQua = await create("job 3 - phải bị chặn");
+
+      assert.match(loiCuaTool(ketQua), /trần|chạm|đủ 2/i);
+      assert.equal(store.listJobsForThread("acc-1", "t-cap").length, 2, "job thứ 3 không được lưu");
+    } finally {
+      tuning.setTuning("SCHEDULER_MAX_JOBS_PER_THREAD", null);
+    }
+  });
+
+  it("job đã TẮT không tính vào trần - hủy bớt rồi vẫn tạo lại được", async () => {
+    tuning.setTuning("SCHEDULER_MAX_JOBS_PER_THREAD", 1);
+    try {
+      const ctx = makeCtx({ message: msg({ threadId: "t-cap-tat" }) });
+      await run(ctx, {
+        action: "create",
+        name: "job 1",
+        kind: "message",
+        payload: "p",
+        schedule: { kind: "every", minutes: 30 },
+      });
+      const [job1] = store.listJobsForThread("acc-1", "t-cap-tat");
+      store.setEnabled("acc-1", "t-cap-tat", job1!.id, false);
+
+      const ketQua = await run(ctx, {
+        action: "create",
+        name: "job 2",
+        kind: "message",
+        payload: "p",
+        schedule: { kind: "every", minutes: 30 },
+      });
+      assert.doesNotMatch(ketQua, /trần|chạm/i, "job đã tắt không được tính vào trần");
+    } finally {
+      tuning.setTuning("SCHEDULER_MAX_JOBS_PER_THREAD", null);
+    }
+  });
+
+  it("lịch không hợp lệ (every quá dày) trả câu lỗi có chữ, KHÔNG throw, không lưu job", async () => {
+    const ctx = makeCtx({ message: msg({ threadId: "t-invalid-every" }) });
+    const result = await run(ctx, {
+      action: "create",
+      name: "x",
+      kind: "message",
+      payload: "y",
+      schedule: { kind: "every", minutes: 1 },
+    });
+
+    assert.match(loiCuaTool(result), /tối thiểu|spam/i);
+    assert.equal(store.listJobsForThread("acc-1", "t-invalid-every").length, 0);
+  });
+
+  it("lịch once đã ở quá khứ trả câu lỗi có chữ, không lưu job", async () => {
+    const ctx = makeCtx({ message: msg({ threadId: "t-invalid-past" }) });
+    const result = await run(ctx, {
+      action: "create",
+      name: "x",
+      kind: "message",
+      payload: "y",
+      schedule: { kind: "once", date: "2020-01-01", time: "08:00" },
+    });
+
+    assert.match(loiCuaTool(result), /quá khứ/);
+    assert.equal(store.listJobsForThread("acc-1", "t-invalid-past").length, 0);
+  });
+});
+
+describe("schedule_task - action list", () => {
+  it("chỉ liệt kê job của đúng thread, không lẫn thread khác", async () => {
+    const ctxA = makeCtx({ message: msg({ threadId: "t-list-a" }) });
+    const ctxB = makeCtx({ message: msg({ threadId: "t-list-b" }) });
+    await run(ctxA, { action: "create", name: "A1", kind: "message", payload: "p", schedule: { kind: "every", minutes: 30 } });
+    await run(ctxB, { action: "create", name: "B1", kind: "message", payload: "p", schedule: { kind: "every", minutes: 30 } });
+
+    const result = await run(ctxA, { action: "list" });
+    assert.match(result, /A1/);
+    assert.doesNotMatch(result, /B1/, "không được thấy job của thread khác");
+  });
+
+  it("thread chưa có job nào thì trả câu rõ ràng, không phải chuỗi rỗng", async () => {
+    const ctx = makeCtx({ message: msg({ threadId: "t-list-rong" }) });
+    const result = await run(ctx, { action: "list" });
+    assert.match(result, /chưa có lịch/i);
+  });
+});
+
+describe("schedule_task - action cancel", () => {
+  it("hủy đúng job của thread mình - job biến mất khỏi list", async () => {
+    const ctx = makeCtx({ message: msg({ threadId: "t-cancel-ok" }) });
+    await run(ctx, { action: "create", name: "x", kind: "message", payload: "p", schedule: { kind: "every", minutes: 30 } });
+    const [job] = store.listJobsForThread("acc-1", "t-cancel-ok");
+
+    const result = await run(ctx, { action: "cancel", id: job!.id });
+    assert.match(result, /Đã hủy/);
+    assert.equal(store.listJobsForThread("acc-1", "t-cancel-ok").length, 0);
+  });
+
+  it("hủy job của THREAD KHÁC bị từ chối - job vẫn còn nguyên (chặn IDOR ở tầng store)", async () => {
+    const ctxOwner = makeCtx({ message: msg({ threadId: "t-cancel-chu" }) });
+    await run(ctxOwner, {
+      action: "create",
+      name: "job của chủ",
+      kind: "message",
+      payload: "p",
+      schedule: { kind: "every", minutes: 30 },
+    });
+    const [job] = store.listJobsForThread("acc-1", "t-cancel-chu");
+
+    const ctxKhac = makeCtx({ message: msg({ threadId: "t-cancel-la" }) });
+    const result = await run(ctxKhac, { action: "cancel", id: job!.id });
+
+    assert.match(loiCuaTool(result), /Không tìm thấy/);
+    assert.equal(store.getJob("acc-1", "t-cancel-chu", job!.id)?.id, job!.id, "job của chủ vẫn còn nguyên");
+  });
+
+  it("id không tồn tại trả câu rõ ràng, không throw", async () => {
+    const ctx = makeCtx({ message: msg({ threadId: "t-cancel-khong-ton-tai" }) });
+    const result = await run(ctx, { action: "cancel", id: "khong-ton-tai" });
+    assert.match(loiCuaTool(result), /Không tìm thấy/);
+  });
+});
+
+describe("schedule_task - action update", () => {
+  it("sửa payload và lịch - đọc lại thấy đúng giá trị mới", async () => {
+    const ctx = makeCtx({ message: msg({ threadId: "t-update-ok" }) });
+    await run(ctx, {
+      action: "create",
+      name: "cũ",
+      kind: "message",
+      payload: "nội dung cũ",
+      schedule: { kind: "every", minutes: 30 },
+    });
+    const [job] = store.listJobsForThread("acc-1", "t-update-ok");
+
+    const result = await run(ctx, {
+      action: "update",
+      id: job!.id,
+      payload: "nội dung mới",
+      schedule: { kind: "every", minutes: 60 },
+    });
+
+    assert.match(result, /Đã cập nhật/);
+    const sau = store.getJob("acc-1", "t-update-ok", job!.id)!;
+    assert.equal(sau.payload, "nội dung mới");
+    assert.equal(sau.everyMinutes, 60);
+  });
+
+  it("sửa job của THREAD KHÁC bị từ chối - job vẫn còn nguyên giá trị cũ", async () => {
+    const ctxOwner = makeCtx({ message: msg({ threadId: "t-update-chu" }) });
+    await run(ctxOwner, {
+      action: "create",
+      name: "cũ",
+      kind: "message",
+      payload: "nội dung cũ",
+      schedule: { kind: "every", minutes: 30 },
+    });
+    const [job] = store.listJobsForThread("acc-1", "t-update-chu");
+
+    const ctxKhac = makeCtx({ message: msg({ threadId: "t-update-la" }) });
+    const result = await run(ctxKhac, { action: "update", id: job!.id, payload: "bị đổi trái phép" });
+
+    assert.match(loiCuaTool(result), /Không tìm thấy/);
+    assert.equal(store.getJob("acc-1", "t-update-chu", job!.id)?.payload, "nội dung cũ");
+  });
+
+  it("đổi sang lịch không hợp lệ thì báo lỗi, KHÔNG áp phần thay đổi khác (all-or-nothing)", async () => {
+    const ctx = makeCtx({ message: msg({ threadId: "t-update-invalid" }) });
+    await run(ctx, {
+      action: "create",
+      name: "cũ",
+      kind: "message",
+      payload: "nội dung cũ",
+      schedule: { kind: "every", minutes: 30 },
+    });
+    const [job] = store.listJobsForThread("acc-1", "t-update-invalid");
+
+    const result = await run(ctx, {
+      action: "update",
+      id: job!.id,
+      payload: "nội dung mới lẽ ra không được áp dụng",
+      schedule: { kind: "every", minutes: 1 },
+    });
+
+    assert.match(loiCuaTool(result), /tối thiểu|spam/i);
+    const sau = store.getJob("acc-1", "t-update-invalid", job!.id)!;
+    assert.equal(sau.payload, "nội dung cũ", "lịch hỏng thì payload cũng không được đổi");
+    assert.equal(sau.everyMinutes, 30);
+  });
+});
+
+describe("schedule_task - schema đầu vào (đi qua inputSchema thật)", () => {
+  const parse = (input: unknown) => (toolModule.createScheduleTaskTool(makeCtx()) as any).inputSchema.safeParse(input);
+
+  it("action lạ bị chặn ngay ở schema", () => {
+    assert.equal(parse({ action: "delete" }).success, false);
+  });
+
+  /**
+   * Ràng buộc chéo theo action CỐ Ý không nằm ở schema (xem
+   * `scheduleTaskWireSchema`): schema từ chối thì AI SDK dựng lỗi đầu vào
+   * trước khi `execute` chạy, model mất đường đọc câu lỗi để tự sửa. Hai
+   * khẳng định dưới ghi lại đúng ranh giới đó - đổi hướng là chúng đỏ.
+   */
+  it("thiếu trường theo action thì schema VẪN NHẬN - chốt chặn nằm ở execute, không ở schema", () => {
+    assert.equal(parse({ action: "create" }).success, true, "create trống phải lọt qua schema");
+    assert.equal(parse({ action: "cancel" }).success, true, "cancel thiếu id phải lọt qua schema");
+  });
+
+  it("GỐC của schema là object phẳng, KHÔNG phải oneOf - DeepSeek chối cả request nếu là oneOf", async () => {
+    const { asSchema } = await import("ai");
+    const goc = asSchema((toolModule.createScheduleTaskTool(makeCtx()) as any).inputSchema).jsonSchema as Record<
+      string,
+      unknown
+    >;
+    assert.equal(goc.type, "object");
+    assert.ok(!("oneOf" in goc) && !("anyOf" in goc), "union phải nằm lồng bên trong, không được ở nút gốc");
+    // Union LỒNG vẫn hợp lệ - khẳng định luôn để không ai "sửa" nhầm cả cây
+    const lich = (goc.properties as Record<string, Record<string, unknown>>).schedule;
+    assert.ok(Array.isArray(lich.anyOf), "schedule vẫn phải là union 4 dạng");
+  });
+
+  it("schedule.kind='once' nhận cả 2 dạng date+time và inMinutes (không phải discriminatedUnion, không ném lỗi)", () => {
+    assert.equal(
+      parse({
+        action: "create",
+        name: "x",
+        kind: "message",
+        payload: "y",
+        schedule: { kind: "once", date: "2026-08-01", time: "15:00" },
+      }).success,
+      true,
+    );
+    assert.equal(
+      parse({
+        action: "create",
+        name: "x",
+        kind: "message",
+        payload: "y",
+        schedule: { kind: "once", inMinutes: 30 },
+      }).success,
+      true,
+    );
+  });
+
+  it("inMinutes vượt trần 525600 (1 năm) bị chặn ngay ở schema, không lọt xuống tới new Date() gây RangeError (Mục M3)", () => {
+    assert.equal(
+      parse({
+        action: "create",
+        name: "x",
+        kind: "message",
+        payload: "y",
+        schedule: { kind: "once", inMinutes: 999_999_999 },
+      }).success,
+      false,
+    );
+  });
+});
+
+/**
+ * Schema phẳng nhường phần ràng buộc chéo cho `execute`. Đây là nơi kiểm phần
+ * nhường đó có thật sự bắt - thiếu nó thì `doCreate` nhận `name: undefined` và
+ * ghi thẳng vào DB một job không tên.
+ */
+describe("schedule_task - thiếu tham số theo action bị chặn ở execute", () => {
+  /**
+   * Đọc riêng phần ĐỘNG của câu báo lỗi - danh sách trường zod thật sự bắt được.
+   *
+   * Phải tách ra thay vì `assert.match(loi, /schedule/)`: câu hướng dẫn TĨNH đi
+   * kèm (`action='create' cần đủ: name, kind, payload, schedule.`) đã chứa sẵn
+   * tên cả 4 trường, nên một khẳng định dò chữ trên cả chuỗi vẫn XANH ngay cả
+   * khi phần nêu đích danh bị gỡ mất. Đã kiểm bằng cách phá code đúng chỗ đó.
+   */
+  function truongThieu(loi: string): string[] {
+    const m = /Thiếu hoặc sai tham số: ([^.]*)\./.exec(loi);
+    return m ? m[1]!.split(",").map((s) => s.trim()) : [];
+  }
+
+  it("create thiếu schedule: nêu ĐÍCH DANH trường thiếu, KHÔNG tạo job", async () => {
+    const ctx = makeCtx({ message: msg({ threadId: "t-thieu-schedule" }) });
+    const result = await run(ctx, { action: "create", name: "x", kind: "message", payload: "y" });
+
+    const loi = loiCuaTool(result);
+    assert.deepEqual(truongThieu(loi), ["schedule"], "phải nêu đúng trường thiếu để model gọi lại đúng ngay lần sau");
+    assert.match(loi, /cần đủ/, "kèm cả câu nhắc yêu cầu của action");
+    assert.equal(store.listJobsForThread("acc-1", "t-thieu-schedule").length, 0, "không được ghi job nào");
+  });
+
+  it("create thiếu cả name lẫn payload: liệt kê ĐỦ, không dừng ở trường đầu tiên", async () => {
+    const ctx = makeCtx({ message: msg({ threadId: "t-thieu-nhieu" }) });
+    const result = await run(ctx, { action: "create", kind: "message", schedule: { kind: "every", minutes: 30 } });
+
+    assert.deepEqual(truongThieu(loiCuaTool(result)), ["name", "payload"]);
+    assert.equal(store.listJobsForThread("acc-1", "t-thieu-nhieu").length, 0);
+  });
+
+  it("cancel thiếu id: nêu đích danh id, kèm lối ra (gọi list), không throw", async () => {
+    const result = await run(makeCtx({ message: msg({ threadId: "t-thieu-id" }) }), { action: "cancel" });
+
+    const loi = loiCuaTool(result);
+    assert.deepEqual(truongThieu(loi), ["id"]);
+    assert.match(loi, /list/, "phải chỉ đường lấy id thay vì để model tự đoán");
+  });
+
+  it("update thiếu id cũng bị chặn - không âm thầm sửa nhầm job khác", async () => {
+    const result = await run(makeCtx({ message: msg({ threadId: "t-update-thieu-id" }) }), {
+      action: "update",
+      payload: "nội dung mới",
+    });
+
+    assert.deepEqual(truongThieu(loiCuaTool(result)), ["id"]);
+  });
+
+  it("trường THỪA không thuộc action bị bỏ qua, không làm hỏng lượt gọi hợp lệ", async () => {
+    // Schema phẳng cho phép gửi kèm `id` lúc create; union nghiêm strip nó đi.
+    // Nếu chỗ thu hẹp kiểu dùng `.strict()` thì lượt gọi đúng này sẽ hỏng oan.
+    const ctx = makeCtx({ message: msg({ threadId: "t-truong-thua" }) });
+    const result = await run(ctx, {
+      action: "create",
+      id: "id-thừa-model-tự-thêm",
+      name: "x",
+      kind: "message",
+      payload: "y",
+      schedule: { kind: "every", minutes: 30 },
+    });
+
+    assert.match(result, /Đã tạo lịch/);
+    assert.equal(store.listJobsForThread("acc-1", "t-truong-thua").length, 1);
+  });
+});
+
+/**
+ * Khử trùng khi model gọi `create` lại cho CÙNG một lời nhắc.
+ *
+ * Dựng lại đúng ca thật ngày 2026-08-20 (đọc từ trace): người dùng nhờ đặt
+ * lịch, bot đặt xong ở lượt 2, lượt 3 người dùng chỉ nhắn "okay cảm ơn bạn" và
+ * bot TẠO LẠI y hệt. Model tự khai trong trace: "Mình KIỂM TRA và chốt lịch
+ * nhắc ngay..." - nó muốn kiểm tra, nhưng lịch sử không mang tool call nên
+ * thứ duy nhất trong tầm với là `create`.
+ *
+ * Số đo từ chính hai job đó: `name`/`kind`/`schedule` TRÙNG KHÍT, còn
+ * `payload` KHÁC (model viết lại câu). Vì vậy khóa so trùng cố ý không có
+ * `payload` - xem `tim-lich-hen-trung.ts`.
+ */
+describe("schedule_task - không tạo bản trùng khi model gọi create lại", () => {
+  const lichNhac = {
+    action: "create" as const,
+    name: "Nhắc đóng học phí Phật học",
+    kind: "message" as const,
+    schedule: { kind: "once" as const, date: ONCE_TEST_DATE, time: ONCE_TEST_TIME },
+  };
+
+  it("ca THẬT: cùng tên + cùng mốc, payload model viết khác đi -> vẫn chỉ MỘT job", async () => {
+    const ctx = makeCtx({ message: msg({ threadId: "t-trung-that" }) });
+
+    const lan1 = await run(ctx, {
+      ...lichNhac,
+      payload: "🔔 Kim Phượng ơi, nhớ đóng tiền học phí Phật học nhé! Hạn chót nộp là ngày 05/09/2026.",
+    });
+    const lan2 = await run(ctx, {
+      ...lichNhac,
+      payload: "Kim Phượng ơi, hôm nay nhớ đóng tiền học phí Phật học nhé. Hạn chót nộp là ngày 05/09/2026.",
+    });
+
+    const jobs = store.listJobsForThread("acc-1", "t-trung-that");
+    assert.equal(jobs.length, 1, "tạo ra bản trùng - người dùng sẽ nhận hai tin cùng lúc");
+    assert.match(lan1, /Đã tạo lịch/);
+    assert.match(lan2, /ĐÃ CÓ SẴN/, "lần hai phải nói rõ lịch đã có, không phải vừa tạo thêm");
+    assert.match(lan2, new RegExp(jobs[0]!.id), "phải trả về id của job đã có để model nói đúng");
+    assert.doesNotMatch(lan2, /^Đã tạo lịch/, "không được nói là vừa tạo");
+  });
+
+  it("kết quả lần hai KHÔNG phải dấu hiệu lỗi - trạng thái mong muốn đã có sẵn", async () => {
+    // Repo chốt: nhánh HỎNG trả object `{ok:false,loi}` qua `ketQuaLoi`, nhánh
+    // thành công trả chuỗi trần. Lịch đã có sẵn là THÀNH CÔNG - trả lỗi ở đây
+    // sẽ kích `tool-loop-guard` và làm model tưởng nó vừa thất bại.
+    const ctx = makeCtx({ message: msg({ threadId: "t-trung-khong-loi" }) });
+    await run(ctx, { ...lichNhac, payload: "lần một" });
+    const lan2 = await run(ctx, { ...lichNhac, payload: "lần hai" });
+    ketQuaThanhCong(lan2);
+  });
+
+  it("HAI việc khác nhau vào CÙNG một giờ vẫn đặt được cả hai", async () => {
+    // Ràng buộc do người dùng chốt: "11:00 nhắc đóng học phí" và "11:00 nhắc
+    // họp phụ huynh" là hai việc thật. Khóa so trùng có `name` chính là để
+    // giữ ca này - bỏ `name` đi là chặn oan.
+    const ctx = makeCtx({ message: msg({ threadId: "t-hai-viec" }) });
+    await run(ctx, { ...lichNhac, payload: "đóng học phí" });
+    const khac = await run(ctx, {
+      ...lichNhac,
+      name: "Nhắc họp phụ huynh",
+      payload: "họp phụ huynh",
+    });
+
+    assert.equal(store.listJobsForThread("acc-1", "t-hai-viec").length, 2, "chặn oan lịch thứ hai");
+    assert.match(khac, /Đã tạo lịch/);
+    assert.match(khac, /LƯU Ý/, "phải nhắc model rằng đã có lịch khác cùng mốc giờ");
+    assert.match(khac, /Nhắc đóng học phí Phật học/, "phải nêu tên lịch cùng mốc để model nói lại được");
+  });
+
+  it("tên chỉ khác hoa/thường và khoảng trắng thừa vẫn tính là trùng", async () => {
+    const ctx = makeCtx({ message: msg({ threadId: "t-trung-chuan-hoa" }) });
+    await run(ctx, { ...lichNhac, payload: "x" });
+    const lan2 = await run(ctx, {
+      ...lichNhac,
+      name: "  nhắc ĐÓNG   học phí Phật học ",
+      payload: "y",
+    });
+    assert.equal(store.listJobsForThread("acc-1", "t-trung-chuan-hoa").length, 1);
+    assert.match(lan2, /ĐÃ CÓ SẴN/);
+  });
+
+  it("lịch ĐÃ TẮT thì đặt lại được - job đó không bao giờ chạy nữa", async () => {
+    // Chặn ở đây là sai: người dùng nhờ đặt lại đúng lời nhắc họ vừa tắt là
+    // yêu cầu hợp lệ, mà job cũ thì `listDueJobs` không bao giờ nhặt.
+    const ctx = makeCtx({ message: msg({ threadId: "t-da-tat" }) });
+    await run(ctx, { ...lichNhac, payload: "x" });
+    const [cu] = store.listJobsForThread("acc-1", "t-da-tat");
+    store.setEnabled("acc-1", "t-da-tat", cu!.id, false);
+
+    const lan2 = await run(ctx, { ...lichNhac, payload: "y" });
+    assert.match(lan2, /Đã tạo lịch/, "lịch đã tắt mà vẫn bị coi là trùng");
+    assert.equal(store.listJobsForThread("acc-1", "t-da-tat").length, 2);
+  });
+
+  it("thread KHÁC không ảnh hưởng nhau", async () => {
+    const a = makeCtx({ message: msg({ threadId: "t-pham-vi-a" }) });
+    const b = makeCtx({ message: msg({ threadId: "t-pham-vi-b" }) });
+    await run(a, { ...lichNhac, payload: "x" });
+    const ketQuaB = await run(b, { ...lichNhac, payload: "x" });
+    assert.match(ketQuaB, /Đã tạo lịch/, "khử trùng bị rò sang cuộc trò chuyện khác");
+    assert.equal(store.listJobsForThread("acc-1", "t-pham-vi-b").length, 1);
+  });
+});

@@ -1,0 +1,90 @@
+import assert from "node:assert/strict";
+import { after, before, beforeEach, describe, it } from "node:test";
+import { cleanupTestEnv, setupTestEnv } from "../shared/test-env-setup.js";
+
+let dataDir: string;
+let store: typeof import("./kb-source-store.js");
+let binding: typeof import("./kb-agent-binding.js");
+let database: typeof import("../conversation/database.js");
+let n1: { id: string };
+let n2: { id: string };
+
+before(async () => {
+  dataDir = setupTestEnv();
+  store = await import("./kb-source-store.js");
+  binding = await import("./kb-agent-binding.js");
+  database = await import("../conversation/database.js");
+});
+
+after(() => {
+  database.closeDatabase();
+  cleanupTestEnv(dataDir);
+});
+
+beforeEach(() => {
+  for (const t of ["kb_sources", "kb_chunks", "kb_chunks_fts", "agent_kb_sources"]) {
+    database.db.exec(`DELETE FROM ${t}`);
+  }
+  n1 = store.taoNguon({ ten: "nguồn 1", loai: "text", noiDungGoc: "a" });
+  n2 = store.taoNguon({ ten: "nguồn 2", loai: "text", noiDungGoc: "b" });
+});
+
+describe("kb-agent-binding - mặc định đóng", () => {
+  it("agent chưa gán nguồn nào thì đọc được RỖNG - mặc định đóng", () => {
+    assert.deepEqual(binding.nguonCuaAgent("agent-moi"), []);
+  });
+
+  it("agent khác được gán không làm agent này thấy nguồn", () => {
+    binding.datNguonChoAgent("agent-a", [n1.id]);
+    assert.deepEqual(binding.nguonCuaAgent("agent-b"), []);
+  });
+
+  /**
+   * `tool-catalog-read.ts` dùng `agent.id === ""` làm quy ước "route /api/tools
+   * không biết agent nào" (xem `SCOPE_KHONG_CO_AGENT_THAT` ở tool-routes.ts) -
+   * bất biến CẦN GIỮ ĐÚNG để quy ước đó an toàn là chuỗi rỗng KHÔNG BAO GIỜ
+   * đọc ra nguồn thật, kể cả khi chưa ai gán gì cho nó. Hàm này không có gì
+   * đặc biệt hoá `""` (không chặn ở tầng ghi/đọc) - test này canh để một ngày
+   * nào đó có dòng agent_id = '' lọt vào bảng thì đây là chỗ đỏ đầu tiên.
+   */
+  it("id rỗng cũng đọc ra RỖNG - route /api/tools dùng chuỗi rỗng làm quy ước 'không có agent'", () => {
+    assert.deepEqual(binding.nguonCuaAgent(""), []);
+  });
+});
+
+describe("kb-agent-binding - đặt lại là THAY THẾ", () => {
+  it("đặt lại danh sách là THAY THẾ, không cộng dồn", () => {
+    binding.datNguonChoAgent("a1", [n1.id, n2.id]);
+    binding.datNguonChoAgent("a1", [n2.id]);
+    assert.deepEqual(binding.nguonCuaAgent("a1"), [n2.id]);
+  });
+
+  it("đặt lại thành mảng rỗng thì thu hồi hết quyền đọc", () => {
+    binding.datNguonChoAgent("a1", [n1.id, n2.id]);
+    binding.datNguonChoAgent("a1", []);
+    assert.deepEqual(binding.nguonCuaAgent("a1"), []);
+  });
+
+  it("id trùng trong danh sách truyền vào không làm nổ UNIQUE", () => {
+    binding.datNguonChoAgent("a1", [n1.id, n1.id]);
+    assert.deepEqual(binding.nguonCuaAgent("a1"), [n1.id]);
+  });
+});
+
+describe("kb-agent-binding - agentCuaNguon (chiều ngược)", () => {
+  it("một nguồn được nhiều agent gán thì trả đủ cả hai id", () => {
+    binding.datNguonChoAgent("a1", [n1.id]);
+    binding.datNguonChoAgent("a2", [n1.id]);
+    assert.deepEqual(binding.agentCuaNguon(n1.id), ["a1", "a2"]);
+  });
+
+  it("nguồn chưa agent nào gán thì trả rỗng", () => {
+    assert.deepEqual(binding.agentCuaNguon(n1.id), []);
+  });
+
+  it("chỉ trả agent gán ĐÚNG nguồn này, không lẫn nguồn khác", () => {
+    binding.datNguonChoAgent("a1", [n1.id]);
+    binding.datNguonChoAgent("a2", [n2.id]);
+    assert.deepEqual(binding.agentCuaNguon(n1.id), ["a1"]);
+  });
+});

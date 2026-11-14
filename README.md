@@ -1,0 +1,569 @@
+<p align="center">
+  <img src="web/public/zalo-agent-logo.webp" alt="Zalo Agent" width="240" />
+</p>
+
+<p align="center">
+Agent AI thường trú trên Zalo. Chạy được trên <strong>hai loại kênh</strong>: tài khoản Zalo <strong>cá nhân</strong> (qua zca-js)<br/>
+và tài khoản <strong>Zalo Bot chính thức</strong> (qua Zalo Bot API). Nhiều account chạy chung một tiến trình,<br/>
+mỗi account một "não" riêng, 15 công cụ, dashboard web đầy đủ. Tự host, không phụ thuộc nhà cung cấp LLM nào.
+</p>
+
+<p align="center">
+  <a href="#cài-đặt">Cài đặt</a> •
+  <a href="#hai-loại-kênh">Hai loại kênh</a> •
+  <a href="#agent-làm-được-gì">Tính năng</a> •
+  <a href="#chế-độ-chỉ-đọc-log-zalo-theo-ngày-cho-ai-lọc-việc">Chế độ chỉ đọc</a> •
+  <a href="#dashboard">Dashboard</a> •
+  <a href="#an-toàn---đọc-trước-khi-chạy">An toàn</a> •
+  <a href="docs/system-architecture.md">Kiến trúc</a> •
+  <a href="README.en.md">English</a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="MIT" />
+  <img src="https://img.shields.io/badge/TypeScript-3178C6?style=flat-square&logo=typescript&logoColor=white" alt="TypeScript" />
+  <img src="https://img.shields.io/badge/Node-22.13+-339933?style=flat-square&logo=nodedotjs&logoColor=white" alt="Node" />
+  <img src="https://img.shields.io/badge/SQLite-node:sqlite-003B57?style=flat-square&logo=sqlite&logoColor=white" alt="SQLite" />
+  <img src="https://img.shields.io/badge/AI_SDK-Vercel-000000?style=flat-square&logo=vercel&logoColor=white" alt="Vercel AI SDK" />
+  <img src="https://img.shields.io/badge/tests-2657%20xanh-brightgreen?style=flat-square" alt="tests" />
+</p>
+
+> [!NOTE]
+> Repo của **Nguyễn Hữu Phúc** ([HuuPhucGL](https://github.com/HuuPhucGL)). Có thêm
+> **chế độ chỉ đọc**: tài khoản Zalo không trả lời ai, chỉ ghi mọi tin nhắn ra file theo ngày để
+> Claude / Antigravity đọc và lọc việc cần làm. Xem
+> [Chế độ chỉ đọc](#chế-độ-chỉ-đọc-log-zalo-theo-ngày-cho-ai-lọc-việc). Mọi tính năng khác giữ nguyên.
+
+---
+
+Luồng một lượt: **tin Zalo -> lọc (allowlist, @mention) -> gộp theo thread -> agent loop (LLM tự
+gọi tool) -> làm sạch + dịch định dạng -> cắt theo trần byte -> gửi**.
+
+Không có bước nào chạy code do model sinh ra. Nội dung lấy từ web luôn bị bọc trong thẻ đánh dấu
+là dữ liệu, không phải mệnh lệnh.
+
+## Hai loại kênh
+
+Một tiến trình chạy được cả hai loại tài khoản cùng lúc, trộn lẫn tùy ý. Chọn loại **lúc tạo
+account** trên dashboard, không đổi được sau đó.
+
+| | Tài khoản cá nhân | Tài khoản Zalo Bot chính thức |
+|---|---|---|
+| Thư viện / API | [`zca-js`](https://github.com/RFS-ADRENO/zca-js) (**không chính thức**) | **Zalo Bot API** - `bot-api.zaloplatforms.com` (chính thức) |
+| Đăng nhập | quét QR ngay trên dashboard | dán **Bot Token** vào dashboard |
+| Nhận tin | WebSocket listener + tự kết nối lại | long polling `getUpdates` |
+| Rủi ro khóa tài khoản | **có** - chỉ dùng nick phụ | **không** |
+| Ai nhắn được | phải là bạn bè | ai có link cũng nhắn được |
+| Công cụ dùng được | đủ **15** | **7 trong 15** (xem bảng dưới) |
+| Định dạng chữ | định dạng gốc Zalo (`textProperties`) | chữ trơn |
+| Trần một tin | theo cấu hình (mặc định 2000 ký tự) | 2000 ký tự, server ép cứng |
+| Gửi file / ảnh / thả cảm xúc / tag | có | **không có method trên API** |
+| Lịch hẹn | có | có |
+| Allowlist mặc định | mở | **đóng** (`mode: "list"`) |
+
+> [!IMPORTANT]
+> **Zalo Bot API KHÁC Zalo OA API.** Hai sản phẩm này bị nhầm lẫn khắp nơi, kể cả trong tài liệu
+> bên thứ ba. Chính sách "chỉ được nhắn trong 7 ngày kể từ tương tác cuối" và biểu phí gửi tin là
+> của **OA API** (`openapi.zalo.me`), **không** áp cho Bot API mà dự án này dùng.
+
+### Tạo tài khoản Zalo Bot
+
+1. Mở Zalo, tìm Official Account **"Zalo Bot Manager"**.
+2. Chọn **"Tạo bot"** (mở mini app Zalo Bot Creator). Tên bot **bắt buộc bắt đầu bằng "Bot"**.
+3. Token được gửi vào tin nhắn Zalo cho bạn.
+4. Dashboard > **Accounts** > Thêm account > Loại kênh = **Tài khoản bot chính thức** > dán token.
+
+Server **kiểm token với Zalo trước khi lưu** (gọi `getMe`) - token sai thì không lưu gì cả, tránh
+dựng ra một account trông như đã cấu hình xong mà không bao giờ chạy. Lưu xong account tự khởi
+động lại ngay.
+
+### Vì sao 8 công cụ không chạy trên kênh Bot
+
+Không phải chọn cho an toàn - là **đo trên API sống**: dò 17 method, 13 cái trả
+`{"ok":false,"description":"Not Found","error_code":404}`. Không tồn tại
+`sendDocument` / `sendFile` / `sendVideo` / `sendAudio` / `editMessageText` / `deleteMessage` /
+`setMessageReaction` / `forwardMessage` / `getChat` / `getChatMember`.
+
+Những công cụ đó bị **gỡ khỏi schema** gửi cho model (model không biết chúng tồn tại, không tốn
+token mô tả, không thể bị prompt injection dụ gọi) **và** persona được ghép thêm một luật nói rõ
+đây là giới hạn nền tảng chứ agent không hỏng - ai nhờ thì agent trả lời thẳng là tài khoản bot
+không gửi được, mời nhắn qua tài khoản cá nhân. Ẩn công cụ mà không nói lý do thì người nhắn
+tưởng agent bị lỗi.
+
+> Trước đây danh sách này có **8** công cụ - `schedule_task` nằm trong đó. Nó là mục duy nhất
+> không dẫn được một số đo 404 nào: Bot API gửi chủ động tốt (đo: 10 tin trong 416ms), chỉ là
+> bộ hẹn lịch khóa cứng vào `zca-js` nên tài khoản bot không có đường gửi. Đã nối ở V3.19.
+
+## Agent làm được gì
+
+15 công cụ, bật/tắt từng cái theo account ngay trên dashboard.
+
+| Công cụ | Làm gì | Kênh Bot |
+|---|---|---|
+| `web_search` | Tìm web theo chuỗi nguồn (Brave -> DuckDuckGo). DuckDuckGo không cần key | có |
+| `web_fetch` | Đọc 1 URL công khai. Chặn IP nội bộ và metadata cloud (chống SSRF) | có |
+| `kb_search` | Tra tài liệu chủ agent tự nạp (chính sách, bảng giá, hướng dẫn) - FTS5 + bm25, hợp nhất bằng RRF | có |
+| `save_memory` | Ghi nhớ lâu dài về người dùng, sống qua nhiều phiên chat | có |
+| `get_datetime` | Ngày giờ chính xác theo múi giờ cấu hình | có |
+| `read_image` | Nhìn kỹ lại ảnh với câu hỏi cụ thể: đếm số lượng, đọc chữ nhỏ, soi chi tiết | có |
+| `create_image` | Vẽ ảnh AI mới, hoặc **SỬA ảnh người dùng vừa gửi** - phần còn lại giữ nguyên từng pixel | không |
+| `create_word_document` | Soạn .docx (tiêu đề, đoạn văn, bảng, hai cột) rồi gửi thẳng trong chat | không |
+| `create_excel_file` | Soạn .xlsx nhiều sheet, **có công thức kèm sẵn kết quả** nên xem trước trên điện thoại vẫn thấy số | không |
+| `send_file` | Gửi file từ kho `data/shared-files/` hoặc tải từ URL công khai | không |
+| `schedule_task` | Đặt/xem/sửa/hủy lịch để agent tự nhắn lại đúng cuộc trò chuyện này | có |
+| `tag_member` | @mention đúng người trong nhóm | không |
+| `get_group_info` | Tên nhóm, số thành viên, danh sách thành viên | không |
+| `add_reaction` | Thả cảm xúc vào tin nhắn | không |
+| `tai_video` | Tải video TikTok/Facebook bản không watermark rồi gửi thẳng vào chat | không |
+
+Bộ công cụ thật của một lượt là **phần giao** giữa hai danh sách tắt: **agent** khai năng lực
+("vai này biết làm gì"), **account** áp chính sách ("nick này được phép làm gì"). Không bên nào
+bật ngược lại được bên kia, nên thêm một agent mới không bao giờ nới rộng quyền của một nick.
+
+Lượt chạy theo lịch còn hẹp hơn nữa: **10 công cụ bị loại** khỏi lượt đó, vì lượt theo lịch chạy cô
+lập khỏi lịch sử chat và 6 trong số đó gửi thẳng ra Zalo, né mất trần "số tin chủ động mỗi ngày".
+
+### Tin nhắn có định dạng thật
+
+Trên kênh cá nhân, agent không trả về một khối chữ phẳng. Markdown của model được **dịch** thành
+định dạng gốc của Zalo (`textProperties`), không phải bị xóa đi:
+
+- **In đậm**, *in nghiêng*, ~~gạch ngang~~, gạch chân, tiêu đề cỡ lớn
+- **Bốn màu chữ** (đỏ, cam, vàng, xanh lá) cho thư mời và thông báo trang trọng
+- Emoji dẫn dòng chọn theo đúng nghĩa của dòng
+
+Toàn bộ đã **đo trên máy thật, cả Zalo Web lẫn Zalo điện thoại** - hai client render khác nhau
+ở vài chỗ, và những chỗ đó đã bị loại khỏi thiết kế. Zalo còn từ chối cả tin khi chữ cộng định
+dạng vượt một ngưỡng byte, nên bộ gửi tự co trần ký tự cho vừa ngân sách rồi mới cắt.
+
+Kênh Bot gửi **chữ trơn** - không phải vì sợ lỗi, mà vì chữ tới đường gửi đã hết markdown rồi
+(lớp dịch đã bóc dấu ra thành `Style[]` ở tầng trên), nên xin server dựng lại chỉ có thể bớt ký tự.
+
+### Kho tri thức (RAG)
+
+Nạp tài liệu để agent tra cứu bằng công cụ `kb_search` - chính sách công ty, bảng giá, hướng dẫn
+nội bộ, FAQ.
+
+- Định dạng: **.docx, .xlsx, .pdf, .txt, .md** hoặc gõ tay thẳng trên dashboard
+- Tìm bằng **SQLite FTS5 + bm25**, hợp nhất nhiều truy vấn bằng **RRF** (chừa sẵn chỗ cho lớp vector sau)
+- Nội dung nạp bằng **công cụ**, KHÔNG nhét sẵn vào prompt - giữ nguyên khoản đầu tư prompt cache
+  của những lượt không đụng tới kho
+- Mỗi agent chỉ đọc được nguồn **đã gán tường minh** cho nó. Mặc định **không** nguồn nào
+- Kiểm **chữ ký thật của file** (magic bytes) cho docx/xlsx/pdf, không tin đuôi tên
+- Đọc file + cắt đoạn chạy trong **worker thread riêng**, có hai cầu dao: tài liệu quay CPU vô hạn
+  bị `terminate()` cắt, tài liệu phình heap bị chặn bằng trần RAM đặt trên dashboard
+- Đọc docx/xlsx bằng **SAX theo luồng**, không phải regex bắt cặp thẻ: đo được cặp regex cũ khóa
+  cứng event loop **38,09 giây** trên một bom XML 1,7 KB nén (ReDoS bậc hai). Số đó nằm trong test
+  hồi quy
+
+### MCP client (cắm server ngoài)
+
+Bot làm MCP **client**: cắm các server MCP bên ngoài (chỉ transport HTTP, không stdio - VPS hạn
+chế chạy lệnh tùy ý) để agent tự khám phá và gọi tool của chúng, xếp chồng lên 15 công cụ built-in.
+
+- **Gán theo từng agent, mặc định TẮT** (default-deny): phải gán server cho agent cụ thể trên
+  dashboard, agent chưa gán không thấy tool ngoài nào - người lạ chat với agent chưa cấu hình
+  không chạm được tool ngoài
+- Kết quả tool ngoài bọc như **nội dung không tin cậy**, cùng hàng rào với `web_fetch`; nhánh hỏng
+  không ném lỗi ra ngoài
+- Header xác thực (token, API key server MCP) mã hóa **AES-256-GCM** như mọi secret khác trong dự án
+- **Fingerprint drift**: chụp "dấu vân tay" bộ tool lúc người vận hành duyệt - server đổi tool
+  ngầm sau đó thì rơi về trạng thái "chờ duyệt lại", không nạp tool cho tới khi duyệt lại
+- Mọi tool ngoài xếp nhóm `action` (không tin annotation server tự khai) và bị loại khỏi lượt chạy
+  theo lịch
+- `MCP_ENABLED` là kill-switch runtime - tắt trên dashboard là chặn ngay, không cần xóa từng gán
+
+Quản lý ở tab **MCP** trên dashboard. Sơ đồ kiến trúc đầy đủ:
+[`docs/mcp-client-architecture.html`](docs/mcp-client-architecture.html).
+
+### Lịch hẹn (agent tự nhắn)
+
+Ba loại lịch: `once`, `every`, `cron`. Đặt bằng lời ngay trong chat hoặc trên dashboard.
+
+- Loại `message`: gửi nguyên văn, **0 token**
+- Loại `agent`: chạy một lượt AI riêng, cô lập khỏi lịch sử chat (tra cứu rồi báo cáo)
+- Hai lớp chống spam: chặn lịch lặp quá dày lúc tạo, và trần số tin chủ động mỗi ngày
+- Lịch trễ vẫn GỬI kèm nhãn "(nhắc trễ, lịch gốc HH:MM)" thay vì im lặng nuốt
+- Không nhận chuỗi ngày giờ dạng tự do - chỉ `{date, time}` rời hoặc `{inMinutes}`, vì chuỗi naive
+  qua `new Date()` bị hiểu theo giờ hệ điều hành. Mọi quy đổi múi giờ đi qua một đường duy nhất
+
+### Trí nhớ
+
+- Lịch sử hội thoại trong SQLite, theo account + thread
+- **Rolling summary**: phần rơi khỏi cửa sổ replay được tóm tắt lại chứ không mất
+- **Ngân sách token thật** cho ngữ cảnh (đặt riêng được cho từng agent), không chỉ đếm số tin -
+  vượt ngân sách thì bỏ ảnh cũ trước, rồi mới bỏ tin cũ
+- **Fact bền** qua `save_memory`, có luật riêng tư bất đối xứng giữa chat riêng và nhóm
+- Ảnh nhận được lưu lại, mô tả bằng model vision phụ và cache lại để lượt sau khỏi trả tiền lần nữa
+
+### Chế độ chỉ đọc: log Zalo theo ngày cho AI lọc việc
+
+Dành cho người làm việc nhiều trên Zalo: tin trôi nhanh, việc được giao giữa chừng một nhóm đông
+rất dễ bị sót. Bật chế độ này thì tài khoản **im lặng hoàn toàn** (không trả lời, không báo "đã
+nhận", không gửi lịch hẹn) và chỉ làm một việc: ghi mọi tin ra file theo ngày. Việc đọc và tổng hợp
+giao cho một AI khác (Claude Code, Claude Desktop, Antigravity) chạy theo lịch trên máy bạn.
+
+**Không cần cấu hình LLM**: chế độ này không gọi model nào. Dòng cảnh báo "Chưa cấu hình LLM" lúc
+khởi động có thể bỏ qua.
+
+#### Cài đặt nhanh
+
+1. Cài như mục [Cài đặt](#cài-đặt), thêm vào `.env` thư mục log (nên để ngoài `data/`, vì `data/`
+   chứa cookie Zalo):
+   ```env
+   CHAT_EXPORT_DIR=F:\Zalo-Logs
+   ```
+2. `pnpm build:web` rồi `pnpm start`, mở `http://127.0.0.1:3900`, đăng nhập bằng `DASHBOARD_PASSWORD`.
+3. **Accounts** > thêm account, loại kênh **cá nhân** > quét QR bằng app Zalo (nên dùng nick phụ).
+4. Sửa account > **Policies** > bật **Chế độ chỉ đọc** > Lưu.
+5. Nhắn thử vài tin (chữ, file, sticker, trả lời một tin) rồi mở thư mục log kiểm tra.
+
+#### Ghi lại những gì
+
+| Loại | Trong log |
+|---|---|
+| Tin chữ, nhiều dòng | nguyên văn, giữ xuống dòng |
+| Tin chính bạn gửi (từ điện thoại / Zalo PC) | ghi là `Tôi (tên)` |
+| Ảnh | tải về `<ngày>/tep/`, dòng log trỏ tới bản trên máy |
+| File, video, tin thoại | tải về `<ngày>/tep/` (giữ đuôi gốc), kèm tên + link gốc Zalo |
+| Liên kết web | tên + link (không tải trang web) |
+| Sticker, vị trí | dấu giữ chỗ `[sticker]`, `[vị trí]` |
+| Tin trả lời (trích dẫn) | dòng `> Trả lời **Người A**: nội dung tin gốc` |
+| Tin bị thu hồi | dòng "đã thu hồi một tin", kèm giờ + trích đoạn tin gốc nếu còn nhớ |
+| Nhóm không @mention, người ngoài allowlist | ghi hết, chế độ này không lọc |
+
+#### Cấu trúc thư mục
+
+```
+<CHAT_EXPORT_DIR>/                  mặc định data/exports
+  CLAUDE.md, AGENTS.md              công thức tra cứu cho AI (theo ngày / nhóm / người / từ khóa)
+  <account-id>/
+    00_trang-thai.md                bot còn chạy không, mất kết nối lúc nào, lần tải bù gần nhất
+    00_danh-ba.md                   MỌI cuộc trò chuyện (tên, nhóm/riêng, Thread ID, file, ngày đầu-cuối,
+                                    số tin) và MỌI người (tên, ID, chat riêng không, có mặt nhóm nào)
+    2026-10-05/
+      00_muc-luc.md                 mục lục ngày: cuộc nào, bao nhiêu tin, ai nhắn, giờ đầu-cuối
+      nhom/kinh-doanh.md            chat nhóm, mỗi cuộc một file
+      rieng/nguyen-van-a.md         chat riêng, mang tên người kia
+      tep/                          ảnh, file, video, tin thoại đã tải về (1130_bao-gia.xlsx...)
+    _du-lieu/                       dữ liệu máy đọc, không cần mở
+      2026-10-05.jsonl              mọi tin trong ngày, 1 dòng JSON / tin (có msgId, senderId)
+      danh-ba.json, trang-thai.json, muc-luc-2026-10-05.json
+```
+
+Tệp được tải ngay lúc nhận nên không lo link Zalo hết hạn, và Claude mở đọc được thẳng nội dung
+(Word, Excel, PDF, ảnh). Mỗi tệp tối đa `CHAT_EXPORT_MAX_FILE_MB` (mặc định 100 MB, đặt trong `.env`;
+`0` = không tải); vượt trần thì chỉ ghi link kèm lý do.
+
+Tên file là tên nhóm / tên người viết không dấu, nên `*/rieng/nguyen-van-a.md` là toàn bộ lịch sử
+chat với người đó qua các ngày. Hai cuộc trùng tên thì cuộc sau thêm 4 số cuối ID
+(`kinh-doanh-6789.md`). Thread ID nằm ở dòng đầu mỗi file và trong `00_danh-ba.md`, nên nhóm có đổi
+tên vẫn tra chính xác được. Chat riêng mà bạn nhắn trước thì bot hỏi Zalo tên người kia.
+
+Cách Claude tra cứu (đã ghi sẵn trong `CLAUDE.md`):
+
+| Câu hỏi | Claude làm |
+|---|---|
+| Hôm nay có gì | đọc `00_muc-luc.md` của ngày, rồi mở các file trong đó |
+| Nhóm X bàn gì tuần này | tra `00_danh-ba.md` lấy Thread ID, mở `*/nhom/` có ID đó |
+| Người Y giao gì | bảng Người trong `00_danh-ba.md`: chat riêng + các nhóm Y có mặt |
+| Tìm từ khóa | tìm trong `_du-lieu/*.jsonl` |
+
+Một file `.md` trông như sau:
+
+```markdown
+# Kinh Doanh (Nhóm) - 2026-10-05
+
+- Tài khoản: acc-chinh
+- Thread ID: 123456789
+
+- 09:15 **Anh B**: Gửi báo giá cho khách A trước 17h nhé
+- 09:17 **Tôi (Phúc)**: ok anh, chiều em gửi
+  > Trả lời **Anh B**: Gửi báo giá cho khách A trước 17h nhé
+- 16:40 **Tôi (Phúc)**: [file]
+  - Đính kèm (file): [bao-gia-khach-a.xlsx](https://...)
+```
+
+Ngày tính theo `BOT_TIMEZONE` (mặc định `Asia/Ho_Chi_Minh`). Tin được **nối thêm ngay khi tới**,
+nên AI đọc lúc nào cũng thấy dữ liệu mới nhất. Tên file chốt ở tin đầu tiên trong ngày; nhóm đổi
+tên giữa ngày vẫn ghi chung một file.
+
+#### Tự tổng hợp báo cáo bằng lịch chạy của Claude
+
+Dùng **tác vụ hẹn giờ của Claude Desktop** (Scheduled tasks, chạy trên máy bạn). Đừng dùng
+routine trên cloud (`/schedule`): nó chạy trên máy chủ của Anthropic, không đọc được ổ đĩa của bạn.
+Câu lệnh mẫu:
+
+```text
+Đọc thư mục F:\Zalo-Logs theo hướng dẫn trong F:\Zalo-Logs\CLAUDE.md.
+Lọc việc trong log của hôm nay (giờ Việt Nam), gồm cả việc tồn 3 ngày trước chưa thấy trả lời "xong/ok".
+Ghi kết quả ra F:\Zalo-Logs\bao-cao\<yyyy-MM-dd>.md dạng bảng:
+Việc | Người giao | Hạn | Trạng thái | Nguồn (file + giờ).
+Không bịa thông tin ngoài log; ngày nào không có thư mục thì ghi "không có log".
+```
+
+Tác vụ chỉ chạy khi máy bật và cả zalo-agent lẫn Claude Desktop đang mở. File `CLAUDE.md` dặn AI
+đọc `00_trang-thai.md` trước: bot tắt, mất kết nối hay lỗi đăng nhập thì báo cáo có cảnh báo ngay
+đầu, không lặng lẽ báo "hôm nay ít việc".
+
+#### Tự tổng hợp công việc + dashboard
+
+Bộ mẫu ở `templates/cong-viec/` biến log thành **sổ công việc lâu dài**: việc tồn đọng được mang
+sang ngày sau, việc xong được đánh dấu, việc quá hạn nổi lên đầu. Chép cả thư mục vào
+`<CHAT_EXPORT_DIR>/cong-viec/`, điền mục **Cấu hình** trong `HUONG-DAN.md` (người / nhóm quan trọng),
+rồi tạo tác vụ hẹn giờ trên Claude Desktop với câu lệnh:
+
+```text
+Làm đúng theo F:\Zalo-Logs\cong-viec\HUONG-DAN.md: cập nhật sổ công việc từ log Zalo mới,
+viết báo cáo hôm nay, làm mới dashboard. Trả lời tôi ngắn gọn: cảnh báo (nếu có),
+5 việc quan trọng nhất, số việc quá hạn và tồn đọng.
+```
+
+| File | Vai trò |
+|---|---|
+| `HUONG-DAN.md` | Luật: thế nào là việc, chấm điểm ưu tiên (hạn, người quan trọng, từ khóa gấp, tiền / hợp đồng, bị nhắc lại, tồn đọng), quy trình mỗi lần chạy |
+| `so-cong-viec.json` | Sổ công việc, nguồn sự thật; mỗi việc có nguồn (file log + giờ + trích) |
+| `dashboard.html` + `du-lieu-dashboard.js` | Mở bằng trình duyệt, không cần mạng. Ba kiểu xem: **Danh sách** (lọc trạng thái / người), **Kanban** (Mới / Đang làm / Chờ phản hồi / Xong), **Ma trận Eisenhower** (Làm ngay / Lên lịch / Giao / Để sau, chấm theo hai trục Gấp và Quan trọng); chi tiết tin gốc, biểu đồ 14 ngày |
+| `ghi-chu-tay.md` | Lệnh tay (`#12 xong`, `#7 han 2026-10-10`), lần chạy sau áp dụng |
+| `bao-cao/<ngày>.md` | Báo cáo từng ngày |
+
+#### Trạng thái và tải bù tin
+
+- **Sổ trạng thái** `00_trang-thai.md`: Đang kết nối / Mất kết nối / Đã dừng / Lỗi đăng nhập, kèm giờ.
+  Khi đang kết nối, bot ghi lại file này mỗi 5 phút; "Cập nhật lúc" cũ hơn 15 phút nghĩa là bot
+  đã tắt hoặc treo.
+- **Tải bù tin nhắn bị lỡ**: mỗi lần kết nối (khởi động hoặc nối lại sau khi rớt mạng), bot xin Zalo
+  các tin sau tin cuối cùng đã ghi, bỏ tin trùng theo `msgId`, rồi ghi như tin thường. Tin tải bù
+  được nối vào cuối file nên có thể lệch thứ tự giờ. Lần chạy đầu tiên không tải bù.
+
+#### Tự chạy khi bật máy (Windows)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\windows\cai-tu-khoi-dong.ps1   # đăng ký
+Start-ScheduledTask -TaskName zalo-agent                                          # chạy ngay
+powershell -ExecutionPolicy Bypass -File scripts\windows\go-tu-khoi-dong.ps1    # gỡ
+```
+
+Tác vụ Task Scheduler tên `zalo-agent`, chạy ẩn 1 phút sau khi đăng nhập Windows, tự khởi động lại
+tối đa 5 lần nếu tiến trình chết. Khi đã bật tự chạy thì **đừng `pnpm start` bằng tay** (hai tiến
+trình tranh cổng 3900 và tranh phiên Zalo). `Stop-ScheduledTask` không tắt tiến trình node con: muốn
+dừng hẳn thì tắt tiến trình node đang giữ cổng 3900.
+
+#### Giới hạn cần biết
+
+- **Tải bù phụ thuộc Zalo**: chưa đo được Zalo trả lùi bao xa hay tối đa bao nhiêu tin một lần. Bot
+  tắt lâu (nhiều ngày) hoặc nhóm rất đông có thể vẫn thiếu tin; xem số tin tải bù trong `00_trang-thai.md`.
+  Tin bị thu hồi trong lúc bot tắt không tải bù được.
+- **Không mở Zalo Web của chính nick đó trên trình duyệt**: Zalo chỉ cho một phiên web, bot và tab
+  trình duyệt sẽ đá nhau liên tục. Zalo trên điện thoại dùng bình thường.
+- Tin thu hồi chỉ trích được tin gốc nếu bot nhận tin đó **từ lúc khởi động gần nhất** (nhớ trong RAM).
+- Tệp lớn hơn `CHAT_EXPORT_MAX_FILE_MB` chỉ được ghi link. Thư mục `tep/` lớn dần theo thời gian,
+  nhớ dọn định kỳ nếu ổ cứng nhỏ.
+- Bật chế độ này thì lịch sử trong DB **không bị cắt** theo `HISTORY_MAX_MESSAGES_PER_THREAD`, DB sẽ
+  lớn dần theo thời gian.
+- Log chứa tin nhắn của người khác: giữ trên máy, không đưa lên GitHub hay dịch vụ ngoài.
+
+## Dashboard
+
+Hono + React + Tailwind, phục vụ ngay từ chính tiến trình agent tại `http://127.0.0.1:3900`.
+
+| Trang | Dùng để |
+|---|---|
+| Tổng quan | Token vào/ra theo ngày, gộp mọi account |
+| Accounts | Thêm tài khoản Zalo, chọn **loại kênh** (cá nhân / bot chính thức), **quét QR login ngay trên web** hoặc dán **Bot Token**, bật/tắt từng account |
+| Agents | Mỗi account một "não": persona riêng, model riêng, bộ công cụ riêng, nguồn tri thức riêng |
+| Sessions | Đọc lại từng cuộc trò chuyện, xem tóm tắt agent tự dựng, bật/tắt agent theo thread, **xóa sạch ngữ cảnh** một cuộc trò chuyện |
+| Contacts | Danh bạ đã gặp |
+| Memory | Xem, sửa, xóa từng điều agent đã nhớ |
+| Kho tri thức | Nạp tài liệu (upload hoặc gõ tay), xem đoạn đã cắt, gán nguồn cho từng agent để `kb_search` tra |
+| Lịch hẹn | Danh sách lịch, chạy thử ngay, lịch sử từng lần chạy |
+| Tools | Bật/tắt 15 công cụ theo account, cấu hình vẽ ảnh và model vision. Chọn một account bot thì công cụ nền tảng không hỗ trợ hiện rõ lý do |
+| MCP | Thêm/sửa/xóa MCP server ngoài (chỉ HTTP), gán server cho từng agent (mặc định tắt), duyệt lại khi bộ tool đổi (drift) |
+| Cấu hình | **70 tham số** vận hành chỉnh nóng, không cần khởi động lại, chia 13 nhóm |
+| Trace | Xem lại từng bước của một lượt agent: model nghĩ gì, gọi tool nào, tham số ra sao |
+| Logs | Nhật ký hệ thống |
+
+13 nhóm cấu hình: Nhà cung cấp LLM, Chung, Lượt trả lời (9), Ngữ cảnh & Trí nhớ (6), Tra cứu web
+(2), Tạo file Word/Excel (5), Tải video (6), Vẽ ảnh (4), Gửi tin trên Zalo (11), Trace và dọn dẹp (4), Lịch hẹn
+(9), Kho tri thức (9), MCP server ngoài (4).
+
+Thứ tự ưu tiên cấu hình ở mọi nơi: **dashboard (DB) > `.env` > mặc định trong schema**. Thiếu cấu
+hình LLM không chặn boot - phải vào được dashboard mới nhập được.
+
+## Vì sao đáng tin
+
+Đây là phần khó thấy từ ảnh chụp màn hình, nhưng là phần chiếm nhiều công nhất.
+
+**Chịu được lỗi thật của môi trường thật**
+
+- Mọi lời gọi LLM đi qua **streaming**. Router nằm sau Cloudflare, mà Cloudflare cắt bằng 524 nếu
+  origin chưa trả byte đầu trong 100 giây. Đo trên router thật với prompt sinh 4000 chữ:
+  non-stream chết ở giây 125, streaming xong ở giây 135 với byte đầu ở giây 7,5
+- **Gộp tin theo thread**: người ta nhắn ngắt quãng ba tin thì agent trả lời một lần, không đẻ ra
+  ba lượt làm lại từ đầu
+- **Chèn tin giữa lượt**: nhắn thêm trong lúc agent đang chạy thì tin đó được kéo vào ngay ở ranh
+  giới bước, không phải đợi lượt sau
+- Câu trả lời bị Zalo từ chối vì định dạng thì **gửi lại dạng chữ trơn** - mất định dạng chứ
+  không mất nội dung
+- Chống lặp vòng tool ba tầng, trần thời gian mỗi lượt, trần token đầu ra
+- Phân loại lỗi nhà cung cấp thay vì thử lại mù: hết quota tôn trọng `Retry-After` thật, tràn ngữ
+  cảnh cắt sâu hơn rồi thử lại, sai khóa thì KHÔNG thử lại và báo câu riêng
+
+**Phòng prompt injection nghiêm túc** (agent đọc tin của người lạ)
+
+- Nội dung web bọc trong thẻ `<noi_dung_ngoai>` có **nonce ngẫu nhiên sinh mỗi lần gọi**, persona
+  dạy rõ đó là dữ liệu chứ không phải lệnh. Kẻ tấn công soạn nội dung trước khi biết nonce nên
+  không thể viết ra thẻ đóng giả
+- `web_fetch` và `send_file` chặn loopback, mạng nội bộ, endpoint metadata của cloud
+- **Không có tool chuyển tiền hay thanh toán** - cố ý không làm, dù thư viện có sẵn
+- Tool tạo file chỉ nhận **dữ liệu** (tiêu đề, đoạn văn, bảng), tuyệt đối không chạy code model sinh ra
+- Câu trả lời rò system prompt bị chặn hẳn trước khi ra Zalo
+- Mọi biểu thức chính quy chạm nội dung ngoài đều tuyến tính (chống ReDoS)
+
+**Bảo mật tại chỗ**
+
+- Cookie Zalo và Bot Token mã hóa **AES-256-GCM**, khóa nằm ngoài DB
+- Bot Token nằm trong ĐƯỜNG DẪN của Zalo Bot API (`/bot{token}/{method}`), nên client che token
+  trong mọi chuỗi sắp vào thông điệp lỗi - ba lớp che, vì đã dựng lại được đường token đi từ trang
+  lỗi của cổng trung gian vào dashboard và vào file log
+- Mật khẩu dashboard băm bằng scrypt, có rate-limit đăng nhập
+- Toàn bộ dữ liệu nằm trên máy bạn: SQLite trong `data/`, không gửi đi đâu ngoài nhà cung cấp LLM bạn chọn
+
+## Cài đặt
+
+```bash
+corepack enable
+pnpm install
+copy .env.example .env
+```
+
+`.env` chỉ có **2 dòng phải điền**:
+
+| Biến | Lấy ở đâu |
+|---|---|
+| `CREDENTIALS_ENCRYPTION_KEY` | `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
+| `DASHBOARD_PASSWORD` | tự đặt, tối thiểu 8 ký tự |
+
+Mọi thứ còn lại nhập trên dashboard: nhà cung cấp LLM + model + API key (**Cấu hình > Nhà cung cấp
+LLM**, làm trước tiên), rồi tài khoản Zalo (trang **Accounts** - quét QR cho tài khoản cá nhân,
+hoặc dán Bot Token cho tài khoản bot). Không cần file `config/accounts.json` - DB là nguồn sự thật.
+
+## Chạy
+
+```bash
+pnpm dev                    # agent (watch mode) + dashboard
+pnpm build:web              # build UI -> web/dist, tiến trình tự serve tại http://127.0.0.1:3900
+pnpm dev:web                # dev UI dashboard (Vite, proxy vào API)
+pnpm zalo-login acc-chinh   # login QR bằng CLI (cách cũ - trên web tiện hơn; chỉ dùng cho tài khoản CÁ NHÂN)
+pnpm zalo-bot-check         # dò Zalo Bot API bằng token thật, in ra method nào sống method nào 404
+pnpm test                   # 2657 test
+pnpm typecheck              # bắt buộc chạy trước khi báo hoàn thành
+pnpm eval                   # 17 case chạy MODEL THẬT, không tin nào ra Zalo thật
+```
+
+## Nhà cung cấp LLM
+
+Cắm rời qua `LLM_PROVIDER`, đổi được lúc chạy từ dashboard:
+
+- `openai-compatible` - bất kỳ endpoint nào theo chuẩn OpenAI (router proxy, OpenRouter, LM Studio, Ollama...)
+- `anthropic` - gọi thẳng API gốc của Anthropic
+- `google` - gọi thẳng API gốc của Google (Gemini). Phải đi đường này chứ không
+  qua lớp giả OpenAI của họ: lớp giả làm rơi `thought_signature` nên mọi lượt
+  có gọi công cụ sẽ lỗi
+
+Vẽ ảnh và model vision phụ cấu hình riêng, cũng theo chuẩn OpenAI-compatible.
+
+## An toàn - đọc trước khi chạy
+
+> [!WARNING]
+> `zca-js` là API **không chính thức**. Zalo có thể khóa tài khoản.
+> **Chỉ dùng nick phụ.** Đừng dùng tài khoản chính hay tài khoản có giá trị.
+> Rủi ro này **không áp cho tài khoản Zalo Bot chính thức** - đó là API công khai của Zalo.
+
+- `data/` chứa cookie Zalo và Bot Token (đã mã hóa) cùng toàn bộ lịch sử - **không commit, không chia sẻ**
+- Mỗi tài khoản cá nhân chỉ được một listener: mở Zalo Web trên trình duyệt sẽ đá listener của
+  agent (agent tự kết nối lại và đá ngược lại)
+- Tài khoản bot mặc định **đóng allowlist**, khác tài khoản cá nhân - bán kính khác hẳn: nick cá
+  nhân phải là bạn bè mới nhắn được, còn bot thì ai có link cũng nhắn được, mở sẵn là mời người lạ
+  đốt token và thử prompt injection
+- Dự án **cố ý không làm** gửi tin hàng loạt hay campaign CRM
+- Deploy sau Caddy/Nginx thì đặt `DASHBOARD_BEHIND_PROXY=true` (rate-limit đúng IP + cookie `Secure`)
+
+## Kiểm thử
+
+| | |
+|---|---|
+| Test đơn vị + tích hợp | **2657**, chạy bằng `node:test`, không framework ngoài, 243 file test |
+| Case eval chạy model THẬT | **17** - đo thứ test không đo nổi: có tra cứu thay vì đoán không, có hỏi lại khi thiếu thông tin không, trình bày có dễ đọc không |
+| Nguồn | ~41.900 dòng (không tính test), 355 file |
+
+Eval nhìn thấy được **cả định dạng thật sự gửi lên Zalo**, không chỉ chữ trần - nên lỗi trình bày
+bị máy bắt chứ không đợi người dùng phát hiện.
+
+Kỷ luật khi sửa: **phá code rồi chạy lại test để chắc nó ĐỎ**, trước khi báo một bản sửa là xong.
+Test xanh không chứng minh gì nếu nó cũng xanh khi logic sai. Và khi thay một biểu thức bảo mật đã
+có: chạy **cả hai bản** trên **cùng một tập payload**, khẳng định tập bắt của bản mới là siêu tập
+của bản cũ - phép phá chỉ chứng minh code mới CẦN cho test mới, không bao giờ chứng minh nó BAO
+TRÙM code cũ.
+
+## Cấu trúc
+
+```
+src/
+├── config/        env (Zod), account store, agent store, 70 tham số chỉnh nóng
+├── zalo/          [kênh CÁ NHÂN] login QR, credential mã hóa, listener + reconnect, parse tin,
+│                  lớp làm sạch + dịch markdown sang định dạng Zalo, cắt tin theo byte,
+│                  trừu tượng hóa năng lực kênh (KenhLuot)
+├── zalo-bot/      [kênh BOT] client Zalo Bot API, long polling, parser update, bảng năng lực
+│                  + chặn tool, router riêng, runner theo account
+├── agent/         agent loop (AI SDK), provider, persona, tools/ (15 công cụ)
+├── scheduler/     lịch hẹn: tick, giành job, trần tin chủ động, lịch sử chạy
+├── conversation/  SQLite: history, threads, contacts, usage, memory, ảnh, summarizer
+├── middleware/    allowlist + @mention, gộp tin theo thread, rate limit gửi
+├── documents/     dựng .docx / .xlsx
+├── knowledge/     Kho tri thức - đọc docx/xlsx/pdf/txt/md an toàn (SAX + trần
+│                  chống zip bomb), cắt đoạn, FTS5+RRF, worker thread trích xuất
+├── mcp/           MCP client: cắm MCP server ngoài (chỉ HTTP), gán theo agent (default-deny),
+│                  fingerprint drift khi server đổi tool ngầm
+├── images/        vẽ ảnh, model vision phụ
+└── server/        dashboard API (Hono)
+web/               dashboard UI (React + Vite + Tailwind)
+evals/             bộ eval chạy model thật
+docs/              kiến trúc, roadmap, hướng dẫn phát hành
+```
+
+## Tài liệu
+
+- [Kiến trúc hệ thống](docs/system-architecture.md) - thiết kế và lý do từng quyết định kỹ thuật,
+  gồm cả bảng đo thật của Zalo Bot API (hình dạng lỗi, giới hạn, method nào tồn tại)
+- [Kiến trúc MCP client](docs/mcp-client-architecture.html) - sơ đồ dashboard -> model, 2 cửa
+  default-deny, fingerprint drift. Mở bằng trình duyệt
+- [Triển khai lên máy chủ](docs/deployment-guide.md) - Docker, reverse proxy, backup, gỡ rối
+- [Dựng máy chủ lần đầu](docs/vps-setup-checklist.md) - user, tường lửa, cron, backup
+- [Roadmap](docs/project-roadmap.md) - toàn bộ lịch sử: lỗi đã gặp, cách đo, quyết định đã chốt và
+  những giới hạn còn lại. Đây là tài liệu dày nhất và trung thực nhất của dự án
+- [Kế toán token của agent](docs/ke-toan-token-cua-agent.html) - tài liệu tự học: cửa sổ ngữ cảnh,
+  token mỗi lượt, một lượt nhiều step, prompt caching. Mở bằng trình duyệt
+- [CHANGELOG](CHANGELOG.md)
+- [Hướng dẫn phát hành](docs/release-guide.md)
+
+## Cập nhật
+
+```bash
+git pull
+pnpm install
+pnpm build:web    # thiếu bước này dashboard vẫn là bản cũ
+```
+
+Dữ liệu trong `data/` giữ nguyên, migration chạy tự động lúc khởi động.
+
+## Đóng góp
+
+Mở issue hoặc pull request. Trước khi gửi PR: `pnpm typecheck` và `pnpm test` phải xanh.
+
+## License
+
+[MIT](LICENSE)
+
+Xây trên [zca-js](https://github.com/RFS-ADRENO/zca-js) (MIT) và
+[Vercel AI SDK](https://github.com/vercel/ai) (Apache-2.0).

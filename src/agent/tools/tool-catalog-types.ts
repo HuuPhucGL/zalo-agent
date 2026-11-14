@@ -1,0 +1,183 @@
+import type { Tool } from "ai";
+import type { API } from "zca-js";
+import type { AccountConfig } from "../../config/account-store.js";
+import type { AgentProfile } from "../../config/agent-store.js";
+import type { ParsedMessage } from "../../zalo/zalo-message-parser.js";
+
+/**
+ * Hình dạng dữ liệu dùng chung cho catalog tool - tách riêng khỏi
+ * `tool-catalog.ts` (giữ `TOOL_DEFINITIONS`) và các file `tool-catalog-*.ts`
+ * theo nhóm (`tool-catalog-read.ts`, `tool-catalog-action.ts`), để 3 file đó
+ * chỉ cần import TYPE từ đây thay vì import lẫn nhau (đổi 1 tool trong nhóm
+ * action không kéo theo phải đọc/hiểu nhóm read).
+ */
+
+/** Bối cảnh 1 lượt xử lý - tools dùng để gọi zca-js đúng account + thread */
+export type ToolContext = {
+  /**
+   * API của zca-js. `null` trên kênh BOT - Zalo Bot API không có method nào
+   * tương đương nên không tool nào dùng tới.
+   *
+   * Điều làm chuyện này an toàn: 8 tool dùng `api` TRÙNG KHÍT 8 tool bị chặn
+   * trên kênh bot (`nang-luc-kenh-bot.ts`). Không phải trùng hợp - chúng bị
+   * chặn vì cần đúng năng lực gửi mà Bot API không có. Nên khi `api` là null
+   * thì `build()` của 8 tool đó không bao giờ được gọi.
+   *
+   * Compiler không thấy được bất biến ấy, nên 8 tool đó gọi `apiCaNhan(ctx)`
+   * để nói ra tường minh thay vì rải `!` khắp nơi.
+   */
+  api: API | null;
+  account: AccountConfig;
+  /**
+   * Agent đang chạy lượt này. BẮT BUỘC (không optional) vì nó là một trong hai
+   * lớp quyết định tool nào được cấp - để optional thì quên truyền sẽ âm thầm
+   * cấp thừa tool thay vì báo lỗi biên dịch. Xem `ToolScope` ở trên.
+   */
+  agent: AgentProfile;
+  /** Tin cuối của lượt - tools tác động (reaction, quote) nhắm vào tin này */
+  message: ParsedMessage;
+  /**
+   * Cả batch của lượt (ảnh và caption Zalo gửi tách tin). read_image cần vì
+   * ảnh của lượt hiện tại CHƯA vào DB khi tool chạy - đọc history là hụt.
+   */
+  batch: ParsedMessage[];
+  /**
+   * Lượt CHẠY THEO LỊCH (job scheduler agent-loop.ts truyền `isolated:true`
+   * xuống đây) - lọc bớt tool theo `runsInScheduledTurn`. Mặc định false/undefined
+   * cho lượt tin nhắn thường.
+   */
+  isolated?: boolean;
+  /**
+   * Báo cho caller biết tool vừa GỬI một tin xuống Zalo, để tin đó vào history.
+   *
+   * 5 tool gửi thẳng qua `enqueueSend`, không đi qua `deliverChatReply` - mà đó
+   * mới là chỗ duy nhất gọi `appendMessage`. Không có đường này thì tin bot gửi
+   * biến mất khỏi dashboard VÀ khỏi trí nhớ của chính bot ở lượt sau.
+   *
+   * Chỉ GHI NHẬN, không tự `appendMessage`: `message-turn-processor` mới biết
+   * đủ ngữ cảnh của lượt (accountId, threadId đích). Nó ghi NGAY lúc được gọi -
+   * tin người dùng đã vào lịch sử từ lúc nhận nên thứ tự tự đúng, không phải
+   * gom lại tới cuối lượt như bản trước.
+   *
+   * Optional vì lượt theo lịch không truyền - 5 tool này vốn đã bị loại khỏi
+   * lượt đó (`runsInScheduledTurn: false`).
+   */
+  ghiNhanDaGui?: (noiDung: string) => void;
+};
+
+/**
+ * Nhóm theo mức rủi ro (học từ toolset của Hermes - webhook chỉ được cấp
+ * tool "đọc"): read = tra cứu, không tác động ra ngoài; action = gửi/sửa
+ * thứ gì đó trên Zalo. UI trang Tools nhóm theo đây.
+ */
+export type ToolGroup = "read" | "action";
+
+/**
+ * Hai lớp cùng quyết định một tool có được cấp hay không (đủ lý do ở
+ * `tool-registry.ts#listAvailableTools`): `agent` khai NĂNG LỰC, `account` áp
+ * CHÍNH SÁCH. Khai Ở ĐÂY (không phải `tool-registry.ts`) vì `available()` bên
+ * dưới cần type này, mà `tool-registry.ts` import ngược qua `tool-catalog.ts`
+ * rồi mới tới file này - khai ở chiều ngược lại sẽ tạo vòng import.
+ *
+ * `agent` giờ có thêm `id` (trước chỉ `disabledTools`) từ khi `kb_search` cần
+ * biết đang dựng tool cho AGENT NÀO để tra đúng nguồn Kho tri thức đã gán
+ * riêng cho agent đó (`nguonCuaAgent(scope.agent.id)`).
+ */
+export type ToolScope = {
+  agent: Pick<AgentProfile, "id" | "disabledTools">;
+  /**
+   * `loai` BẮT BUỘC (không optional): 8 trong 15 tool không chạy được trên kênh
+   * bot, và để optional thì quên truyền sẽ âm thầm cấp thừa tool - model hứa
+   * gửi file rồi thất bại, người nhắn tưởng agent hỏng. Cùng lý do với việc
+   * `agent` bắt buộc ở trên.
+   */
+  account: Pick<AccountConfig, "disabledTools" | "loai" | "handoffNotifyUserId">;
+};
+
+export type ToolDefinition = {
+  /** Tên tool trong schema gửi LLM - đổi là model mất trí nhớ về tool */
+  key: string;
+  /** Tên + mô tả hiển thị trên trang Tools của dashboard */
+  label: string;
+  description: string;
+  group: ToolGroup;
+  /**
+   * Có nút Settings trên dòng tool ở dashboard không. Tool nào đi theo CHUỖI
+   * nhiều nguồn thì có, để người dùng xem thứ tự thử và bật/tắt từng bậc
+   * (mô hình Extractor Chain của GoClaw).
+   */
+  hasSettings?: boolean;
+  /**
+   * Điều kiện runtime để tool vào schema (kiểm mỗi lượt, ngoài chuyện bật/tắt
+   * per account). Tool thiếu hạ tầng (read_image chưa có sidecar) mà vẫn vào
+   * schema thì chỉ tốn token mô tả và dụ model gọi để nhận lỗi.
+   *
+   * Nhận `scope` (agent + account) từ khi `kb_search` cần biết đang dựng cho
+   * AGENT NÀO - trước đó không tool nào cần hơn "hạ tầng đã cấu hình chưa" nên
+   * chữ ký cũ không có tham số. Tool không cần biết agent thì cứ khai
+   * `available: () => ...` như trước, JS/TS cho gọi hàm bỏ qua tham số thừa.
+   */
+  available?: (scope: ToolScope) => boolean;
+  /**
+   * Hiện trên trang Tools khi `available()` false - phải nói RÕ thiếu gì và
+   * sửa ở đâu. Không có dòng này thì UI hiện tool bật sẵn trong khi model
+   * không hề nhận được nó (người dùng tưởng bot có khả năng đó mà không có).
+   */
+  unavailableHint?: string;
+  /**
+   * Tool này có đáng kể ra khi ai đó hỏi "bạn làm được gì" không.
+   *
+   * Mặc định CÓ - phải khai tường minh `false` mới bị loại, để tool mới thêm
+   * không âm thầm biến mất khỏi lời giới thiệu.
+   *
+   * Vì sao cần: mục Khả năng liệt kê thẳng từ danh bạ này, nên có tool là hạ
+   * tầng chứ không phải năng lực người dùng quan tâm cũng lọt vào. Người dùng
+   * nói thẳng khi thấy bot khoe "xem ngày giờ chính xác": "cái đó tôi cũng xem
+   * được, đưa vào năng lực làm gì". Khoe những thứ ai cũng làm được thì cả danh
+   * sách trông nghiệp dư.
+   *
+   * KHÁC hẳn việc tắt tool: model VẪN nhận schema và vẫn gọi được bình thường,
+   * chỉ là không đem ra quảng cáo.
+   */
+  keTrongKhaNang?: boolean;
+  /**
+   * Tool này có được cấp trong lượt CHẠY THEO LỊCH (job scheduler) không.
+   * Mặc định true - phải khai TƯỜNG MINH false mới bị loại. Chín tool loại,
+   * hai nhóm lý do khác nhau:
+   *
+   * - Không có hạ tầng cho lượt cô lập: `add_reaction` (không có `msgId` thật
+   *   để thả vào), `read_image` (không có ảnh nào trong lượt), `save_memory`
+   *   (đường nội dung web đi vào trí nhớ vĩnh viễn là prompt injection thật,
+   *   và lượt theo lịch vốn không có phát ngôn nào của user để mà học),
+   *   `schedule_task` (luật số 1 của Hermes: job không được đẻ job).
+   * - Gửi tin THẲNG qua `enqueueSend` (rate-limiter THEO THREAD của
+   *   `middleware/rate-limiter.ts`), KHÔNG đi qua `deliverProactively`/
+   *   `reserveProactiveSlot` của scheduler - vào lượt theo lịch sẽ né hoàn
+   *   toàn trần `SCHEDULER_MAX_PROACTIVE_PER_DAY` vì bộ đếm trần chỉ tăng ở
+   *   đường đó: `send_file`, `create_word_document`, `create_excel_file`,
+   *   `create_image`, `tag_member`. Loại tới khi nhóm này có đường đếm trần
+   *   đúng đắn (đợt sau) - báo cáo dạng CHỮ (kind='message'/'agent' trả text)
+   *   vẫn là use case chính, không bị ảnh hưởng.
+   */
+  runsInScheduledTurn?: boolean;
+  build: (ctx: ToolContext) => Tool;
+};
+
+/**
+ * Lấy `api` của kênh tài khoản cá nhân, khẳng định nó có thật.
+ *
+ * Dùng ở 8 tool cần zca-js. Nhánh ném KHÔNG THỂ tới được trong lúc chạy bình
+ * thường: `listAvailableTools` đã loại đúng 8 tool này khỏi lượt của kênh bot
+ * nên `build()` của chúng không bao giờ chạy khi `api` null. Viết ra để trình
+ * biên dịch có chỗ bám, và để ai nối kênh mới sau này vấp phải một thông điệp
+ * nói rõ chuyện gì thay vì một `TypeError: cannot read property of null`.
+ */
+export function apiCaNhan(ctx: Pick<ToolContext, "api">): API {
+  if (!ctx.api) {
+    throw new Error(
+      "Tool này cần API tài khoản cá nhân (zca-js) nhưng lượt đang chạy trên kênh khác - " +
+        "lẽ ra nó đã bị listAvailableTools loại khỏi lượt này",
+    );
+  }
+  return ctx.api;
+}
